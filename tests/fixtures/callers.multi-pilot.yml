@@ -1,0 +1,8 @@
+version: 1
+callers:
+  - repo: example-org/one
+    tier: python-app
+    pilot: true
+  - repo: example-org/two
+    tier: python-app
+    pilot: true

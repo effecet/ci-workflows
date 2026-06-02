@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# uv — this repo doesn't pin a lockfile; deps in pyproject.toml are loose
+# and self-CI doesn't install the package (lint-test-python deleted in v3.1
+# Task 2.5). Lockfile gets re-created locally on any `uv sync` and would
+# churn without value.
+uv.lock
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+
+# Claude Code (per-repo session state, scheduled_tasks.lock, etc.)
+.claude/

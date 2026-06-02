@@ -1,0 +1,8 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Central repo allowlist — keep tiny"
+paths = [
+  '''tests/fixtures/''',
+]

@@ -1,0 +1,2 @@
+- name: Hello
+  run: echo hi

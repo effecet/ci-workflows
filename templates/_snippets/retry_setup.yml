@@ -1,0 +1,8 @@
+- name: {{STEP_NAME}} (with retry)
+  uses: nick-fields/retry@v3
+  with:
+    timeout_minutes: 5
+    max_attempts: 3
+    retry_wait_seconds: 15
+    retry_on: error
+    command: {{STEP_COMMAND}}

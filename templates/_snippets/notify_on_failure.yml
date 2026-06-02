@@ -1,0 +1,74 @@
+- name: Notify on failure
+  if: failure()
+  env:
+    TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_CI_TOKEN }}
+    CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+  run: |
+    set +e
+    [ -z "$TELEGRAM_TOKEN" ] && { echo "⚠️ notify skip: TELEGRAM_CI_TOKEN missing"; exit 0; }
+
+    esc() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
+    REPO=$(esc "$GITHUB_REPOSITORY")
+    SHA_SHORT=$(printf '%s' "$GITHUB_SHA" | cut -c1-7)
+    RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_NUMBER}"
+    COMMIT=$(esc "$(git log -1 --pretty=%s "$GITHUB_SHA" 2>/dev/null | head -c 80)")
+    JOB=$(esc "$GITHUB_JOB"); ACTOR=$(esc "$GITHUB_ACTOR"); REF=$(esc "$GITHUB_REF_NAME")
+
+    case "$GITHUB_EVENT_NAME:$GITHUB_JOB" in
+      schedule:sweep)
+        MSG="🚨 <b>Gitleaks Sweep Failed</b>
+
+    📦 <code>${REPO}</code>
+    🌿 <code>main</code> (scheduled weekly sweep)
+    🔍 Secrets detected in full history
+
+    🔗 <a href=\"${RUN_URL}\">View run</a>" ;;
+      pull_request:*)
+        PR_NUM=$(printf '%s' "$GITHUB_REF" | sed -n 's|refs/pull/\([0-9]*\)/.*|\1|p')
+        MSG="🚨 <b>CI Failed</b>
+
+    📦 <code>${REPO}</code>
+    🔀 PR <a href=\"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/pulls/${PR_NUM}\">#${PR_NUM}</a> · 🔖 <code>${SHA_SHORT}</code>
+    💬 ${COMMIT}
+    👤 ${ACTOR} · ⚙️ <code>${JOB}</code>
+
+    🔗 <a href=\"${RUN_URL}\">View run</a>" ;;
+      *)
+        MSG="🚨 <b>CI Failed</b>
+
+    📦 <code>${REPO}</code>
+    🌿 <code>${REF}</code> · 🔖 <code>${SHA_SHORT}</code>
+    💬 ${COMMIT}
+    👤 ${ACTOR} · ⚙️ <code>${JOB}</code>
+
+    🔗 <a href=\"${RUN_URL}\">View run</a>" ;;
+    esac
+
+    HTTP_CODE=""
+    for attempt in 1 2 3; do
+      HTTP_CODE=$(curl -sS --max-time 10 -o /tmp/tg_resp.json -w "%{http_code}" \
+        --data-urlencode "chat_id=${CHAT_ID}" \
+        --data-urlencode "text=${MSG}" \
+        -d "parse_mode=HTML" -d "disable_web_page_preview=true" \
+        "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage")
+      if [ "$HTTP_CODE" = "200" ]; then
+        echo "✅ Telegram ping sent (attempt ${attempt})"
+        break
+      fi
+      echo "⚠️ Telegram attempt ${attempt} failed: HTTP ${HTTP_CODE}"
+      [ "$attempt" -lt 3 ] && sleep 5
+    done
+    if [ "$HTTP_CODE" != "200" ]; then
+      echo "⚠️ Telegram notify exhausted 3 attempts; last HTTP ${HTTP_CODE}"
+      cat /tmp/tg_resp.json 2>/dev/null
+      if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+        {
+          echo "### ⚠️ Telegram notifier failed"
+          echo ""
+          echo "All 3 send attempts exhausted. Last HTTP: \`${HTTP_CODE}\`."
+          echo ""
+          echo "Job \`${GITHUB_JOB}\` still failed on its actual error — this annotation is about the *notification* not being delivered."
+        } >> "$GITHUB_STEP_SUMMARY"
+      fi
+    fi
+    exit 0

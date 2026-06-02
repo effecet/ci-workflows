@@ -1,0 +1,13 @@
+# actionlint config — teach the linter about Codeberg/Forgejo community runner labels.
+# See: reference_codeberg_actions.md in memory-persistor
+self-hosted-runner:
+  labels:
+    - codeberg-tiny
+    - codeberg-small
+    - codeberg-medium
+    - codeberg-large
+    - codeberg-tiny-lazy
+    - codeberg-small-lazy
+    - codeberg-medium-lazy
+    - codeberg-large-lazy
+    - arm64-runner

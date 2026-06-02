@@ -1,0 +1,35 @@
+# ci-workflows caller registry
+# Consumed by sync.py and drift.py. Schema: see src/ci_workflows/registry.py
+#
+# Replace the example entries below with YOUR repositories, then run sync.py to
+# render and fan out the templated workflows into each caller's .github/workflows/.
+#
+# runs_on strategy (lessons from running this in production):
+#   - A hosted runner with a short hard runtime ceiling (e.g. Forgejo's default
+#     "codeberg-tiny": ~2-min ceiling + a shared global pool) will stall even
+#     tiny jobs at "Starting job" when the pool is contended.
+#   - A self-hosted runner (e.g. a Raspberry Pi 5 labelled "arm64-runner") has no
+#     runtime ceiling but limited concurrency (capacity = N concurrent jobs).
+#   - Strategy that worked: send heavy/long caller CI jobs to the self-hosted
+#     runner; keep the weekly cron sweep on the lightweight hosted runner.
+#   - Override per-job with `runs_on:` as shown below. On GitHub Actions, use
+#     `ubuntu-latest` (or your own self-hosted label) instead.
+version: 1
+callers:
+  # python-app tier — full lint + test
+  - repo: example-org/example-python-app
+    tier: python-app
+    # Optional per-job runner overrides. Omit to use the tier defaults.
+    runs_on:
+      lint-test: ubuntu-latest
+      gitleaks-fast: ubuntu-latest
+
+  # docs-static tier — markdown/docs lint + secret scan only
+  - repo: example-org/example-docs
+    tier: docs-static
+    runs_on:
+      gitleaks-fast: ubuntu-latest
+    # `preserve` opts a caller-specific workflow out of the stale-workflow sweep
+    # so it survives every sync. Example:
+    # preserve:
+    #   - custom-smoke.yml

@@ -1,0 +1,28 @@
+      - name: Setup uv (with persistent cache)
+        run: |
+          set -eu
+          # pi-ci-runner:v3.1+ bakes uv at /usr/local/bin/uv — use it (zero
+          # network). Else shell-install (non-pi runners). Resolve uv via PATH,
+          # NOT a hardcoded $HOME/.local/bin/uv: the astral installer's target
+          # varies by user (root → /usr/local/bin, non-root → ~/.local/bin), so
+          # the old hardcoded path 127'd on the baked root runner — v3.1.0 pilot
+          # bug, fixed v3.1.1.
+          if ! command -v uv >/dev/null 2>&1; then
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+          fi
+          # uv-managed Python 3.12 (~/.local/share/uv/python — persists on runner).
+          uv python install 3.12
+          # Per-job venv (workspace is fresh each run; recreating is ~5-15s warm-cache).
+          uv venv --python 3.12 "$GITHUB_WORKSPACE/.venv"
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv" >> "$GITHUB_ENV"
+          # Perf (Task 2.2): byte-compile installed wheels so first import in the
+          # test step is not paying .pyc compilation cost. Persists in the warm
+          # ~/.cache/uv on the self-hosted runner.
+          echo "UV_COMPILE_BYTECODE=1" >> "$GITHUB_ENV"
+          # Self-hosted (arm64-runner) persistent disk warm-caches ~/.cache/uv (wheel
+          # cache) AND ~/.local/share/uv/python (managed Pythons).
+          # Shell-install (not astral-sh/setup-uv@v8) — Forgejo's data.forgejo.org
+          # mirror lacked the v8 tag (verified 2026-05-14).

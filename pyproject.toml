@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ci-workflows"
+version = "3.1.1"
+description = "Central CI templates + sync tooling for a fleet of repositories"
+requires-python = ">=3.12"
+dependencies = [
+  "pyyaml>=6.0",
+  "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.5",
+]
+
+[project.scripts]
+ci-sync = "ci_workflows.sync:main"
+ci-drift = "ci_workflows.drift:main"
+ci-provision-secrets = "ci_workflows.provision_secrets:main"
+ci-retry = "ci_workflows.retry_ci:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

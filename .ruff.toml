@@ -1,0 +1,6 @@
+# Keep Phase 0 conservative — expanded in Phase 4 of the phased rollout
+line-length = 120
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "W"]

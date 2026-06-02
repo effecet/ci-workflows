@@ -1,0 +1,6 @@
+{
+  "workflow_runs": [
+    {"id": 202, "head_branch": "main", "status": "failure", "conclusion": "", "created_at": "2026-04-20T12:00:00Z"},
+    {"id": 201, "head_branch": "main", "status": "success", "conclusion": "", "created_at": "2026-04-20T11:00:00Z"}
+  ]
+}

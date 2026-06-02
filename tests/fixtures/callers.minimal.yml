@@ -1,0 +1,7 @@
+version: 1
+callers:
+  - repo: example-org/alpha
+    tier: python-app
+    pilot: true
+  - repo: example-org/beta
+    tier: docs-static

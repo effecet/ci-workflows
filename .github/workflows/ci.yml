@@ -1,0 +1,34 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up uv + Python 3.12
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          cache-dependency-glob: "**/pyproject.toml"
+
+      - name: Install dependencies
+        run: |
+          uv venv
+          uv pip install -e '.[dev]' ruff pytest pyyaml
+
+      - name: Install actionlint + shellcheck (for render validation tests)
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          sudo mv ./actionlint /usr/local/bin/
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Pytest
+        run: uv run pytest -q

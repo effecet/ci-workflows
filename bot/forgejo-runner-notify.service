@@ -1,0 +1,58 @@
+[Unit]
+Description=Forgejo Runner Telegram Notifier
+After=forgejo-runner.service
+Wants=forgejo-runner.service
+PartOf=forgejo-runner.service
+
+[Service]
+Type=simple
+User=forgejo-notify
+Group=forgejo-notify
+SupplementaryGroups=systemd-journal
+WorkingDirectory=/var/lib/forgejo-runner-notify
+ExecStart=/usr/local/bin/forgejo-runner-notify
+Restart=on-failure
+RestartSec=10s
+
+# Encrypted credentials
+LoadCredentialEncrypted=forgejo-notify-tg-token:/etc/credstore.encrypted/forgejo-notify-tg-token
+LoadCredentialEncrypted=forgejo-notify-api-token:/etc/credstore.encrypted/forgejo-notify-api-token
+
+# Non-secret env (chat ID)
+EnvironmentFile=/etc/forgejo-runner-notify.env
+
+# Sandbox (same posture as runner)
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @debug @raw-io @reboot @swap @cpu-emulation @obsolete
+
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+ReadWritePaths=/var/lib/forgejo-runner-notify
+UMask=0077
+
+MemoryMax=256M
+CPUQuota=50%
+TasksMax=64
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

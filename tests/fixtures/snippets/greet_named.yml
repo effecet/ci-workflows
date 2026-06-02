@@ -1,0 +1,2 @@
+- name: Greet {{STEP_NAME}}
+  run: {{STEP_COMMAND}}

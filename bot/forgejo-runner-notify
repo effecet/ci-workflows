@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""
+forgejo-runner-notify — tails the forgejo-runner journal, detects job-pickup
+events, posts a rich-formatted Telegram message via the notifier bot.
+
+Stdlib-only. Reads creds from systemd LoadCredentialEncrypted dir.
+
+Fixes for ci-workflows#14 (blank-card noise on non-push events):
+  1. cb_get() retries 3x with exponential backoff so a single API blip
+     doesn't blank a notif.
+  2. fetch_task_metadata() poll-retries briefly when the run record is
+     not yet indexed at the instant the runner picks up the task. Also
+     uses run['title'] for the commit message instead of a second API
+     call to /git/commits/{sha} — halves the failure surface.
+  3. fmt_rich() em-dash fallback for missing slots, and a one-line
+     "metadata pending" card when too many slots are empty (instead of a
+     half-rendered '?'-laden card).
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+CRED_DIR = Path(os.environ.get(
+    'CREDENTIALS_DIRECTORY',
+    '/run/credentials/forgejo-runner-notify.service'
+))
+TG_TOKEN = (CRED_DIR / 'forgejo-notify-tg-token').read_text().strip()
+CB_TOKEN = (CRED_DIR / 'forgejo-notify-api-token').read_text().strip()
+TG_CHAT = os.environ['TELEGRAM_CHAT_ID']
+
+CURSOR_FILE = Path('/var/lib/forgejo-runner-notify/cursor')
+
+# Matches the runner's own log line: "task <N> repo is <owner>/<repo>"
+TASK_PATTERN = re.compile(r"task\s+(\d+)\s+repo\s+is\s+(\S+)", re.IGNORECASE)
+
+# Em-dash used when a slot has no value (per ci-workflows#14 spec).
+DASH = '—'
+
+
+def html_esc(s):
+    return (str(s)
+            .replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;'))
+
+
+def cb_get(path, attempts=3):
+    """GET with retry/backoff. Returns parsed JSON or None on exhausted retries."""
+    url = f'https://codeberg.org/api/v1{path}'
+    req = urllib.request.Request(
+        url, headers={'Authorization': f'token {CB_TOKEN}'}
+    )
+    last_err = None
+    for n in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return json.load(r)
+        except Exception as e:
+            last_err = e
+            if n < attempts:
+                time.sleep(2 ** (n - 1))  # 1s, 2s, 4s
+    print(f'[notify] cb_get {path} failed after {attempts}: {last_err}',
+          file=sys.stderr)
+    return None
+
+
+def fetch_task_metadata(task_id, repo_full):
+    """Enrich via Codeberg API using the most-recent run for the repo.
+
+    Forgejo task_id != run ID, and there's no public task-lookup endpoint.
+    Heuristic: the run we just picked up is the freshest in_progress/queued
+    one for this repo. Fall back to most-recent on no match.
+
+    Poll-retries briefly because the run record may not be indexed at the
+    instant the runner journal logs the task pickup.
+
+    Returns dict with rich fields or None on failure.
+    """
+    if not repo_full:
+        return None
+    # Up to 4 attempts spread over ~6s: try immediately, then 1s, 2s, 3s.
+    runs = None
+    for attempt in range(4):
+        runs = cb_get(f'/repos/{repo_full}/actions/runs?limit=10')
+        if runs and runs.get('workflow_runs'):
+            break
+        if attempt < 3:
+            time.sleep(1 + attempt)
+    if not runs or 'workflow_runs' not in runs or not runs['workflow_runs']:
+        return None
+    candidates = [r for r in runs['workflow_runs']
+                  if r.get('status') in ('queued', 'in_progress', 'running')]
+    run = candidates[0] if candidates else runs['workflow_runs'][0]
+    if not run:
+        return None
+    # Prefer the run's own `title` (commit message first line) over an extra
+    # API call. Only fall back to /git/commits/{sha} if `title` is empty.
+    commit_msg = run.get('title') or ''
+    if not commit_msg and run.get('commit_sha'):
+        commit = cb_get(f'/repos/{repo_full}/git/commits/{run["commit_sha"]}')
+        if commit and isinstance(commit, dict):
+            commit_msg = (commit.get('commit') or {}).get('message', '') \
+                if isinstance(commit.get('commit'), dict) else commit.get('message', '')
+    trigger_user = run.get('trigger_user') or {}
+    actor = (trigger_user.get('login') if isinstance(trigger_user, dict)
+             else str(trigger_user)) or ''
+    return {
+        'repo_full_name': repo_full,
+        'actor': actor,
+        'ref': (run.get('prettyref') or '').replace('refs/heads/', ''),
+        'event': run.get('event') or run.get('trigger_event') or '',
+        'sha': run.get('commit_sha') or '',
+        'workflow_name': run.get('workflow_id') or '',
+        'commit_message': commit_msg,
+        'run_url': run.get('html_url') or '',
+    }
+
+
+def tg_send(html_text):
+    url = f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage'
+    data = urllib.parse.urlencode({
+        'chat_id': TG_CHAT,
+        'text': html_text,
+        'parse_mode': 'HTML',
+        'disable_web_page_preview': 'true',
+    }).encode()
+    req = urllib.request.Request(url, data=data)
+    for attempt in (1, 2, 3):
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                if r.status == 200:
+                    return True
+        except Exception as e:
+            print(f'[notify] tg_send attempt {attempt} failed: {e}',
+                  file=sys.stderr)
+        if attempt < 3:
+            time.sleep(2 ** attempt)
+    return False
+
+
+def _slot(value):
+    """Return the value if it's a non-empty string, else the em-dash fallback."""
+    if value is None:
+        return DASH
+    s = str(value).strip()
+    if not s or s == '?':
+        return DASH
+    return s
+
+
+def fmt_basic(task_id, ts):
+    return (
+        f'🚀 <b>Pi runner: new CI job</b>\n\n'
+        f'⏱ {html_esc(ts)}\n'
+        f'🔢 Task <code>#{html_esc(task_id)}</code>\n\n'
+        f'<i>Check Codeberg → settings → actions → runners for run details.</i>'
+    )
+
+
+def fmt_pending(task_id, repo, ts):
+    """Clean one-line card when metadata couldn't be fetched in time."""
+    safe_repo = html_esc(repo) if repo else DASH
+    actions_url = (
+        f'https://codeberg.org/{repo}/actions' if repo
+        else 'https://codeberg.org/'
+    )
+    return (
+        f'🚧 <b>Pi runner: new CI job — metadata pending</b>\n\n'
+        f'📦 <code>{safe_repo}</code>\n'
+        f'⏱ {html_esc(ts)} · 🔢 Task <code>#{html_esc(task_id)}</code>\n\n'
+        f'🔗 <a href="{actions_url}">Recent runs</a>'
+    )
+
+
+def fmt_rich(task_id, meta, ts):
+    repo_raw = meta.get('repo_full_name', '')
+    repo = html_esc(_slot(repo_raw))
+    actor = html_esc(_slot(meta.get('actor')))
+    ref = html_esc(_slot((meta.get('ref') or '').replace('refs/heads/', '')))
+    event = html_esc(_slot(meta.get('event')))
+    sha_raw = (meta.get('sha') or '')[:7]
+    sha = html_esc(_slot(sha_raw))
+    workflow = html_esc(_slot(meta.get('workflow_name')))
+    commit = html_esc(_slot((meta.get('commit_message') or '').strip()
+                            .split('\n')[0][:80]))
+    run_url = meta.get('run_url') or (
+        f'https://codeberg.org/{repo_raw}/actions' if repo_raw
+        else 'https://codeberg.org/'
+    )
+    # If too many slots are empty, the metadata fetch was effectively useless.
+    # Emit a clean "pending" card instead of a half-rendered '?'-laden one.
+    dash_slots = sum(1 for x in (actor, ref, event, sha, workflow, commit)
+                     if x == DASH)
+    if dash_slots >= 4:
+        return fmt_pending(task_id, repo_raw, ts)
+    return (
+        f'🚀 <b>Pi runner: new CI job</b>\n\n'
+        f'📦 <code>{repo}</code>\n'
+        f'🌿 <code>{ref}</code> · 🔖 <code>{sha}</code> · ⚡ {event}\n'
+        f'💬 {commit}\n'
+        f'👤 {actor} · ⚙️ <code>{workflow}</code>\n\n'
+        f'🔗 <a href="{run_url}">View run</a>'
+    )
+
+
+def main():
+    print('[notify] starting; tailing forgejo-runner journal',
+          file=sys.stderr)
+    cmd = ['journalctl', '-u', 'forgejo-runner.service', '-f',
+           '-o', 'json', '--no-pager']
+    if CURSOR_FILE.exists():
+        cmd += ['--after-cursor', CURSOR_FILE.read_text().strip()]
+    else:
+        cmd += ['-n', '0']
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1)
+
+    seen = set()
+    for line in proc.stdout:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        cursor = entry.get('__CURSOR')
+        if cursor:
+            try:
+                CURSOR_FILE.write_text(cursor)
+            except OSError as e:
+                print(f'[notify] cursor write failed: {e}', file=sys.stderr)
+        msg = entry.get('MESSAGE', '')
+        m = TASK_PATTERN.search(msg)
+        if not m:
+            continue
+        task_id = m.group(1)
+        repo_full = m.group(2) if m.lastindex and m.lastindex >= 2 else None
+        if task_id in seen:
+            continue
+        seen.add(task_id)
+        if len(seen) > 1000:
+            seen = set(list(seen)[-500:])
+        try:
+            ts_us = int(entry.get('__REALTIME_TIMESTAMP', '0'))
+            ts = time.strftime('%H:%M:%S', time.localtime(ts_us / 1_000_000))
+        except (ValueError, TypeError):
+            ts = '?'
+        meta = fetch_task_metadata(task_id, repo_full)
+        if not meta and repo_full:
+            # Metadata fetch exhausted retries — emit pending card with
+            # just the repo + task id instead of a '?'-laden half-card.
+            text = fmt_pending(task_id, repo_full, ts)
+        elif meta:
+            text = fmt_rich(task_id, meta, ts)
+        else:
+            text = fmt_basic(task_id, ts)
+        if tg_send(text):
+            print(f'[notify] sent: task {task_id}', file=sys.stderr)
+        else:
+            print(f'[notify] FAILED: task {task_id}', file=sys.stderr)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,14 @@
+      - name: Install dependencies
+        run: |
+          # Only editable-install if this is actually a Python package. uv's own
+          # heuristic: a [project]/[build-system] table in pyproject.toml, OR a
+          # setup.py / setup.cfg. Config-only pyproject.toml (e.g. just
+          # [tool.pytest.ini_options]) is NOT a package — skip the editable install
+          # and rely on requirements*.txt. No `|| true`: a real package with a
+          # broken build still fails loudly.
+          if [ -f setup.py ] || [ -f setup.cfg ] || { [ -f pyproject.toml ] && grep -qE '^\[(project|build-system)\]' pyproject.toml; }; then
+            uv pip install -e '.[dev]' 2>/dev/null || uv pip install -e .
+          fi
+          if [ -f requirements.txt ]; then uv pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then uv pip install -r requirements-dev.txt; fi
+          uv pip install ruff pytest pytest-xdist

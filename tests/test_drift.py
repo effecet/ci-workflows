@@ -1,0 +1,320 @@
+import base64
+import json
+from pathlib import Path
+from unittest.mock import MagicMock
+
+from ci_workflows.drift import (
+    RESOLVER_ERROR_SENTINEL_PREFIX,
+    _normalize_volatile,
+    check_one_caller,
+    main_report,
+)
+from ci_workflows.forgejo import ForgejoError
+from ci_workflows.registry import Caller
+from ci_workflows.sync import MARKER_PATH, WORKFLOW_DIR
+
+REPO_ROOT = Path(__file__).parent.parent
+
+
+def _fake_client_with(files: dict, default_branch: str = "main"):
+    """files: {'.github/workflows/ci.yml': <content_str>, ...}"""
+    client = MagicMock()
+
+    def get_file(owner, repo, path, ref="main"):
+        if path in files:
+            return {
+                "content": base64.b64encode(files[path].encode("utf-8")).decode("ascii"),
+                "sha": "fakesha",
+            }
+        raise ForgejoError("404")
+
+    client.get_file.side_effect = get_file
+    client.get_repo.return_value = {"default_branch": default_branch, "name": "fake"}
+    return client
+
+
+def test_check_one_caller_returns_true_when_content_matches():
+    caller = Caller(repo="example-org/alpha", tier="python-app", pilot=True)
+    rendered_ci = (REPO_ROOT / "tests/fixtures/python-app/ci_v3_example-app.yml").read_text()
+    rendered_sweep = (REPO_ROOT / "tests/fixtures/rendered-python-app-sweep.v2.min17.yml").read_text()
+    marker = "version: v3.0.0\ntier: python-app\n"
+    client = _fake_client_with(
+        {
+            ".github/workflows/ci.yml": rendered_ci,
+            ".github/workflows/gitleaks-sweep.yml": rendered_sweep,
+            ".ci-workflows-version": marker,
+        }
+    )
+    ok, diffs = check_one_caller(
+        client,
+        caller=caller,
+        expected_files={
+            ".github/workflows/ci.yml": rendered_ci,
+            ".github/workflows/gitleaks-sweep.yml": rendered_sweep,
+            ".ci-workflows-version": marker,
+        },
+    )
+    assert ok
+    assert diffs == []
+
+
+def test_check_one_caller_flags_modified_file():
+    caller = Caller(repo="example-org/alpha", tier="python-app", pilot=True)
+    client = _fake_client_with(
+        {
+            ".github/workflows/ci.yml": "modified locally\n",
+            ".github/workflows/gitleaks-sweep.yml": "sweep\n",
+            ".ci-workflows-version": "v1\n",
+        }
+    )
+    ok, diffs = check_one_caller(
+        client,
+        caller=caller,
+        expected_files={
+            ".github/workflows/ci.yml": "original\n",
+            ".github/workflows/gitleaks-sweep.yml": "sweep\n",
+            ".ci-workflows-version": "v1\n",
+        },
+    )
+    assert not ok
+    assert ".github/workflows/ci.yml" in diffs
+
+
+def test_check_one_caller_flags_missing_file():
+    caller = Caller(repo="example-org/alpha", tier="python-app", pilot=True)
+    client = _fake_client_with(
+        {
+            ".github/workflows/ci.yml": "ci\n",
+        }
+    )
+    ok, diffs = check_one_caller(
+        client,
+        caller=caller,
+        expected_files={
+            ".github/workflows/ci.yml": "ci\n",
+            ".ci-workflows-version": "v1\n",
+        },
+    )
+    assert not ok
+    assert ".ci-workflows-version" in diffs
+
+
+def _fake_client_with_per_ref(files_per_ref: dict, default_branch: str = "main"):
+    """files_per_ref: {'main': {'path': content}, 'master': {...}}.
+
+    Unlike _fake_client_with, this version 404s when ref is wrong — so tests
+    can prove the production code passes the right ref instead of silently
+    falling through.
+    """
+    client = MagicMock()
+
+    def get_file(owner, repo, path, ref="main"):
+        if ref in files_per_ref and path in files_per_ref[ref]:
+            return {
+                "content": base64.b64encode(files_per_ref[ref][path].encode("utf-8")).decode("ascii"),
+                "sha": "fakesha",
+            }
+        raise ForgejoError(f"404: ref={ref} path={path}")
+
+    def get_repo(owner, repo):
+        return {"default_branch": default_branch, "name": repo}
+
+    client.get_file.side_effect = get_file
+    client.get_repo.side_effect = get_repo
+    return client
+
+
+def test_check_one_caller_uses_default_branch_from_repo():
+    """Bug 1 regression: drift was hardcoded ref='main' but 5 callers use master."""
+    caller = Caller(repo="example-org/etf", tier="python-app", pilot=True)
+    files = {
+        ".github/workflows/ci.yml": "ci body\n",
+        ".ci-workflows-version": "version: v1\n",
+    }
+    client = _fake_client_with_per_ref({"master": files}, default_branch="master")
+    ok, diffs = check_one_caller(client, caller=caller, expected_files=files)
+    assert ok, f"expected clean on master-default-branch caller, got diffs={diffs}"
+    assert diffs == []
+
+
+def test_check_one_caller_normalizes_volatile_marker_fields():
+    """Bug 2 regression (marker): real timestamps in synced/source_commit/synced_by must not flag drift."""
+    caller = Caller(repo="example-org/foo", tier="python-app", pilot=True)
+    actual_marker = (
+        "# Auto-generated by ci-workflows sync — do not edit\n"
+        "version: v1.0.1\n"
+        "tier: python-app\n"
+        "source_commit: 2bebb9c1234567890abcdef\n"
+        "synced: 2026-04-23T14:36:00Z\n"
+        "synced_by: sync.py@v1.0.1\n"
+    )
+    expected_marker = (
+        "# Auto-generated by ci-workflows sync — do not edit\n"
+        "version: v1.0.1\n"
+        "tier: python-app\n"
+        "source_commit: fixed\n"
+        "synced: fixed-for-render-reproducibility\n"
+        "synced_by: sync.py@v1.0.1\n"
+    )
+    client = _fake_client_with_per_ref({"main": {MARKER_PATH: actual_marker}})
+    ok, diffs = check_one_caller(client, caller=caller, expected_files={MARKER_PATH: expected_marker})
+    assert ok, f"volatile marker fields must be normalized, got diffs={diffs}"
+
+
+def test_check_one_caller_normalizes_synced_in_workflow_banner():
+    """Bug 2 regression (workflow files): {SYNCED} placeholder lives in ci.yml banner — must not flag drift."""
+    caller = Caller(repo="example-org/foo", tier="python-app", pilot=True)
+    workflow_body = "\non: [push]\njobs:\n  test:\n    runs-on: codeberg-tiny\n"
+    actual_ci = "# header\n# Synced: 2026-04-23T14:36:00Z\n" + workflow_body
+    expected_ci = "# header\n# Synced: fixed-for-render-reproducibility\n" + workflow_body
+    path = f"{WORKFLOW_DIR}/ci.yml"
+    client = _fake_client_with_per_ref({"main": {path: actual_ci}})
+    ok, diffs = check_one_caller(client, caller=caller, expected_files={path: actual_ci})
+    assert ok, f"# Synced: line in workflow banner must be normalized, got diffs={diffs}"
+    # And expected with sentinel value still matches actual with real timestamp
+    client2 = _fake_client_with_per_ref({"main": {path: actual_ci}})
+    ok2, _ = check_one_caller(client2, caller=caller, expected_files={path: expected_ci})
+    assert ok2
+
+
+def test_check_one_caller_records_loud_failure_when_get_repo_errors():
+    """No silent fallback to 'main' if get_repo errors — that would re-introduce Bug 1 invisibly.
+
+    Per feedback_no_silent_fallback: surface the failure in the diff list so it shows up in
+    drift --mode=report JSON / --mode=check stdout instead of silently passing.
+    """
+    caller = Caller(repo="example-org/foo", tier="python-app", pilot=True)
+    client = MagicMock()
+    client.get_repo.side_effect = ForgejoError("502 upstream")
+    ok, diffs = check_one_caller(client, caller=caller, expected_files={MARKER_PATH: "v1\n"})
+    assert not ok
+    assert len(diffs) == 1 and diffs[0].startswith(RESOLVER_ERROR_SENTINEL_PREFIX), (
+        f"expected a single sentinel entry prefixed with {RESOLVER_ERROR_SENTINEL_PREFIX!r}, got {diffs}"
+    )
+
+
+def test_check_one_caller_records_loud_failure_when_default_branch_missing():
+    """get_repo returning a dict with no default_branch (or empty) must also raise the sentinel."""
+    caller = Caller(repo="example-org/foo", tier="python-app", pilot=True)
+    client = MagicMock()
+    client.get_repo.return_value = {"name": "foo"}  # no default_branch key
+    ok, diffs = check_one_caller(client, caller=caller, expected_files={MARKER_PATH: "v1\n"})
+    assert not ok
+    assert diffs[0].startswith(RESOLVER_ERROR_SENTINEL_PREFIX)
+
+
+def test_check_one_caller_still_flags_real_drift_in_workflow_body():
+    """Over-normalization guard (workflow): real step body change must still flag, even with banner timestamp drift."""
+    caller = Caller(repo="example-org/foo", tier="python-app", pilot=True)
+    prefix = "\non: [push]\njobs:\n  test:\n    runs-on: codeberg-tiny\n    steps:\n      - run: "
+    actual_ci = "# header\n# Synced: 2026-04-23T14:36:00Z\n" + prefix + "REAL_DRIFT_HERE\n"
+    expected_ci = "# header\n# Synced: fixed-for-render-reproducibility\n" + prefix + "pytest\n"
+    path = f"{WORKFLOW_DIR}/ci.yml"
+    client = _fake_client_with_per_ref({"main": {path: actual_ci}})
+    ok, diffs = check_one_caller(client, caller=caller, expected_files={path: expected_ci})
+    assert not ok
+    assert path in diffs
+
+
+def test_check_one_caller_still_flags_real_drift_in_marker_body():
+    """Over-normalization guard (marker): real version/tier change must still flag alongside volatile field drift."""
+    caller = Caller(repo="example-org/foo", tier="python-app", pilot=True)
+    actual_marker = "version: v1.0.1\ntier: python-app\nsource_commit: REAL_HASH\nsynced: 2026-04-23T14:36:00Z\n"
+    expected_marker = (
+        "version: v9.9.9\n"  # real drift on version line — must NOT be stripped
+        "tier: python-app\n"
+        "source_commit: fixed\n"
+        "synced: fixed\n"
+    )
+    client = _fake_client_with_per_ref({"main": {MARKER_PATH: actual_marker}})
+    ok, diffs = check_one_caller(client, caller=caller, expected_files={MARKER_PATH: expected_marker})
+    assert not ok, "version: line is NOT a volatile pattern — must flag drift"
+    assert MARKER_PATH in diffs
+
+
+def test_normalize_volatile_marker_strips_only_marker_fields():
+    """Direct unit test: marker patterns strip synced/synced_by/source_commit but not version/tier."""
+    text = "version: v1\ntier: python-app\nsource_commit: abc\nsynced: 2026-04-23\nsynced_by: sync.py\n"
+    out = _normalize_volatile(text, path=MARKER_PATH)
+    assert "version: v1" in out
+    assert "tier: python-app" in out
+    assert "source_commit: <volatile>" in out
+    assert "synced: <volatile>" in out
+    assert "synced_by: <volatile>" in out
+
+
+def test_normalize_volatile_workflow_only_strips_synced_banner():
+    """Direct unit test: workflow-file normalization touches only the # Synced: banner — not body lines."""
+    path = f"{WORKFLOW_DIR}/ci.yml"
+    text = "# header\n# Synced: 2026-04-23\n\non: [push]\njobs:\n  test:\n    steps:\n      - run: echo synced\n"
+    out = _normalize_volatile(text, path=path)
+    assert "# Synced: <volatile>" in out
+    assert "echo synced" in out, "body lines must not be touched"
+
+
+def test_normalize_volatile_workflow_does_not_strip_marker_fields():
+    """A workflow file that contains a top-level synced: key (hypothetical, unindented) must NOT be normalized."""
+    path = f"{WORKFLOW_DIR}/ci.yml"
+    text = "synced: would-be-stripped-by-marker-pattern\n"
+    out = _normalize_volatile(text, path=path)
+    assert out == text, "workflow patterns must not include marker patterns — got over-normalization"
+
+
+def test_main_report_emits_json(capsys):
+    rc = main_report(
+        registry_path=REPO_ROOT / "tests/fixtures/callers.minimal.yml",
+        templates_root=REPO_ROOT / "templates",
+        version="v1",
+        client_factory=lambda: _fake_client_with({}),
+    )
+    assert rc in (0, 1)
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert "callers" in payload
+    assert {c["repo"] for c in payload["callers"]} == {"example-org/alpha", "example-org/beta"}
+
+
+def test_readme_badge_drift_flagged_on_stale():
+    from ci_workflows.drift import README_REGEN_SENTINEL
+
+    caller = Caller(repo="example-org/example-app", tier="python-app", pilot=True, retry_setup=True)
+    stale = (
+        "# example-app\n\n"
+        "[![ruff](https://codeberg.org/example-org/example-app/actions/workflows/ruff.yml/badge.svg)]"
+        "(https://codeberg.org/example-org/example-app/actions?workflow=ruff.yml)\n"
+    )
+    client = _fake_client_with({"README.md": stale})
+    ok, diffs = check_one_caller(client, caller=caller, expected_files={"README.md": README_REGEN_SENTINEL})
+    assert not ok
+    assert "README.md" in diffs
+
+
+def test_readme_badge_drift_clean_on_canonical():
+    from ci_workflows.drift import README_REGEN_SENTINEL
+
+    caller = Caller(repo="example-org/example-app", tier="python-app", pilot=True, retry_setup=True)
+    canonical = (
+        "# example-app\n\n"
+        "[![ci](https://codeberg.org/example-org/example-app/actions/workflows/ci.yml/badge.svg)]"
+        "(https://codeberg.org/example-org/example-app/actions?workflow=ci.yml)\n"
+        "[![gitleaks-sweep](https://codeberg.org/example-org/example-app/actions/workflows/gitleaks-sweep.yml/badge.svg)]"
+        "(https://codeberg.org/example-org/example-app/actions?workflow=gitleaks-sweep.yml)\n"
+    )
+    client = _fake_client_with({"README.md": canonical})
+    ok, diffs = check_one_caller(client, caller=caller, expected_files={"README.md": README_REGEN_SENTINEL})
+    assert ok
+    assert diffs == []
+
+
+def test_readme_badge_drift_clean_on_missing_readme():
+    """Parity with sync_one_caller's silent-skip on missing README:
+    a caller without a README must not be reported as drifted on the
+    README sentinel.
+    """
+    from ci_workflows.drift import README_REGEN_SENTINEL
+
+    caller = Caller(repo="example-org/no-readme", tier="python-app", pilot=True, retry_setup=True)
+    client = _fake_client_with({})  # no files → all 404
+    ok, diffs = check_one_caller(client, caller=caller, expected_files={"README.md": README_REGEN_SENTINEL})
+    assert ok, f"missing README should not be drift; got diffs={diffs}"
+    assert diffs == []
