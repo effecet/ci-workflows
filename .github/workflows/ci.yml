@@ -6,6 +6,9 @@ on:
     - cron: "0 6 * * 1"  # weekly, Mondays 06:00 UTC: keeps the badge honest against dependency drift
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   lint-test:
     runs-on: ubuntu-latest
@@ -21,7 +24,9 @@ jobs:
       - name: Install dependencies
         run: |
           uv venv
-          uv pip install -e '.[dev]' ruff pytest pyyaml
+          # ruff is pinned: an unpinned install turned CI red when a new release
+          # widened the default rules. Bump deliberately (Dependabot cannot see this line).
+          uv pip install -e '.[dev]' 'ruff==0.16.2' pytest pyyaml
 
       - name: Install actionlint + shellcheck (for render validation tests)
         run: |
