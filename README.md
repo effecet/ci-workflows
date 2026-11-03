@@ -61,7 +61,6 @@ flowchart TB
 | `callers.yml` | registry of caller repos with tier + per-job runner overrides |
 | `src/ci_workflows/` | Python package: `registry`, `render`, `forgejo`, `sync`, `drift`, `provision_secrets` |
 | `tests/` | pytest suite (golden-file fixtures for templates + mocked Forgejo responses) |
-| `bot/` | optional self-hosted-runner Telegram notifier (script + systemd unit) |
 
 ## Quick start
 
@@ -183,13 +182,10 @@ The rendered jobs run on whatever runner label you set: the tier default
 runner (e.g. an ARM64 box), give it that label, or target your own label
 per-job. Since v3.3.0 the self-hosted label is the default for every job; a
 hosted runner is a per-job `runs_on:` override for callers that meet its usage
-policy. The optional [`bot/`](./bot/README.md)
-notifier posts a Telegram message on job pickup for a self-hosted runner — set
-`TELEGRAM_CI_TOKEN` and `TELEGRAM_CHAT_ID` as secrets to use it (it's a no-op if
-the token is unset).
+policy.
 
-The failure notification in rendered workflows is configured differently from
-`bot/`: since v3.3.1 it reads the bot token from the `TELEGRAM_CI_TOKEN` secret
+Rendered workflows can post a Telegram message when a job fails: since v3.3.1
+the notification reads the bot token from the `TELEGRAM_CI_TOKEN` secret
 and the chat ID from a `TELEGRAM_CHAT_ID` Actions **variable** (repository or
 organization level; not a secret, and never a literal in the caller). It skips
 with a step-summary warning when either is unset, so a missing variable silences
