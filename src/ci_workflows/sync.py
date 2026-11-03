@@ -230,36 +230,22 @@ def _ensure_branch(client, owner: str, repo: str, *, branch: str, from_ref: str)
 SWEEP_WORKFLOW_DIRS = (".github/workflows", ".forgejo/workflows")
 
 
-def _sweep_stale_workflows(
+def _plan_sweep_ops(
     client,
     owner: str,
     repo: str,
     *,
     branch: str,
-    commit_msg: str,
     preserve: frozenset[str] = frozenset(),
-) -> list[str]:
-    """Delete stale workflow files across BOTH `.github/workflows/` and
-    `.forgejo/workflows/` on `branch`. Returns the list of deleted full paths.
-
-    Codeberg runs workflows from both dirs — many callers have legacy per-repo CI
-    under `.forgejo/workflows/` that templates are meant to replace. Templates
-    target `.github/workflows/` exclusively; anything under `.forgejo/workflows/`
-    is legacy and always swept. In `.github/workflows/`, only non-templated files
-    are swept (templated `ci.yml` + `gitleaks-sweep.yml` are preserved, plus any
-    filenames in `preserve` — caller-specific opt-outs from sweep).
-
-    `preserve` only applies to `.github/workflows/` — `.forgejo/workflows/` is
-    legacy and never has preserved entries.
-
-    Called after writing the templated files so a failure here doesn't prevent
-    the templated workflows from landing. Missing dirs are treated as "nothing
-    to sweep" (list_dir returns []).
+) -> list[dict]:
+    """Plan deletions of stale workflow files across both workflow dirs, returning
+    ChangeFiles `delete` ops instead of issuing deletes. Same selection rules as the
+    old _sweep_stale_workflows: `.forgejo/workflows/*` is always legacy; in
+    `.github/workflows/` the templated files and `preserve` entries are kept.
     """
-    deleted: list[str] = []
+    ops: list[dict] = []
     for sweep_dir in SWEEP_WORKFLOW_DIRS:
-        items = client.list_dir(owner, repo, sweep_dir, ref=branch)
-        for item in items:
+        for item in client.list_dir(owner, repo, sweep_dir, ref=branch):
             if item.get("type") != "file":
                 continue
             name = item.get("name") or ""
@@ -269,48 +255,65 @@ def _sweep_stale_workflows(
                 continue
             if sweep_dir == WORKFLOW_DIR and name in preserve:
                 continue
-            path = f"{sweep_dir}/{name}"
-            client.delete_file(
-                owner,
-                repo,
-                path,
-                sha=item["sha"],
-                message=commit_msg,
-                branch=branch,
-            )
-            deleted.append(path)
-    return deleted
+            ops.append({"operation": "delete", "path": f"{sweep_dir}/{name}", "sha": item["sha"]})
+    return ops
 
 
-def _upsert_file(
+def _upsert_op(
     client,
     owner: str,
     repo: str,
     *,
+    branch: str,
     path: str,
     content: str,
-    branch: str,
-    commit_msg: str,
-) -> None:
+) -> dict:
+    """Build a ChangeFiles create/update op for `path`: update (with current sha)
+    if the file exists on `branch`, else create."""
     b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
-    existing_sha: str | None = None
     try:
-        existing = client.get_file(owner, repo, path, ref=branch)
-        existing_sha = existing.get("sha")
+        existing_sha = client.get_file(owner, repo, path, ref=branch).get("sha")
     except ForgejoError:
         existing_sha = None
     if existing_sha:
-        client.put_file(
-            owner,
-            repo,
-            path,
-            content_b64=b64,
-            message=commit_msg,
-            branch=branch,
-            sha=existing_sha,
-        )
-    else:
-        client.create_file(owner, repo, path, content_b64=b64, message=commit_msg, branch=branch)
+        return {"operation": "update", "path": path, "content": b64, "sha": existing_sha}
+    return {"operation": "create", "path": path, "content": b64}
+
+
+def _plan_write_ops(
+    client,
+    owner: str,
+    repo: str,
+    *,
+    branch: str,
+    rendered: list[RenderedCaller],
+) -> list[dict]:
+    """Plan create/update ops for the marker, each rendered workflow, and (only if
+    its badges changed) the README. Reads shas; issues no writes."""
+    ops: list[dict] = [
+        _upsert_op(client, owner, repo, branch=branch, path=MARKER_PATH, content=rendered[0].marker_content)
+    ]
+    for r in rendered:
+        ops.append(_upsert_op(client, owner, repo, branch=branch, path=r.target_path, content=r.content))
+
+    # README badge regen — include only when content actually changes.
+    try:
+        readme_obj = client.get_file(owner, repo, README_PATH, ref=branch)
+    except ForgejoError:
+        readme_obj = None
+    if readme_obj is not None:
+        current = base64.b64decode(readme_obj["content"]).decode("utf-8")
+        new = _regenerate_readme_badges(current, owner, repo)
+        if new != current:
+            ops.append(
+                {
+                    "operation": "update",
+                    "path": README_PATH,
+                    "content": base64.b64encode(new.encode("utf-8")).decode("ascii"),
+                    "sha": readme_obj["sha"],
+                }
+            )
+    return ops
 
 
 def sync_one_caller(
@@ -327,53 +330,19 @@ def sync_one_caller(
     _ensure_branch(client, owner, repo, branch=branch, from_ref=default)
 
     commit_msg = f"sync: bump to {to_tag}"
-    marker = rendered[0].marker_content
-    _upsert_file(
-        client,
-        owner,
-        repo,
-        path=MARKER_PATH,
-        content=marker,
-        branch=branch,
-        commit_msg=commit_msg,
-    )
-    for r in rendered:
-        _upsert_file(
-            client,
-            owner,
-            repo,
-            path=r.target_path,
-            content=r.content,
-            branch=branch,
-            commit_msg=commit_msg,
-        )
-
-    # Regenerate README CI badges in the same sync commit. Skip silently if the
-    # caller has no README.md — not every repo ships one.
-    try:
-        readme_obj = client.get_file(owner, repo, README_PATH, ref=branch)
-    except ForgejoError:
-        readme_obj = None
-    if readme_obj is not None:
-        current_readme = base64.b64decode(readme_obj["content"]).decode("utf-8")
-        new_readme = _regenerate_readme_badges(current_readme, owner, repo)
-        if new_readme != current_readme:
-            new_b64 = base64.b64encode(new_readme.encode("utf-8")).decode("ascii")
-            client.put_file(
-                owner,
-                repo,
-                path=README_PATH,
-                content_b64=new_b64,
-                message=commit_msg,
-                branch=branch,
-                sha=readme_obj["sha"],
-            )
-
-    # Sweep runs AFTER writes so templated files land even if sweep errors.
     preserve = frozenset(rendered[0].caller.preserve)
-    swept = _sweep_stale_workflows(client, owner, repo, branch=branch, commit_msg=commit_msg, preserve=preserve)
-    if swept:
-        print(f"  {caller_repo}: swept {len(swept)} stale workflow(s): {', '.join(swept)}")
+
+    # Assemble every file change into ONE batch -> one commit -> one CI run.
+    # (Avoids the per-file multi-commit storm whose concurrency-cancelled push
+    # runs left stale push-status failures blocking merge.)
+    ops = _plan_write_ops(client, owner, repo, branch=branch, rendered=rendered)
+    sweep_ops = _plan_sweep_ops(client, owner, repo, branch=branch, preserve=preserve)
+    ops.extend(sweep_ops)
+
+    client.change_files(owner, repo, branch=branch, message=commit_msg, files=ops)
+    if sweep_ops:
+        swept = ", ".join(o["path"] for o in sweep_ops)
+        print(f"  {caller_repo}: swept {len(sweep_ops)} stale workflow(s): {swept}")
 
     existing = [p for p in client.list_pulls(owner, repo, state="open") if p.get("head", {}).get("ref") == branch]
     if existing:
@@ -428,9 +397,15 @@ def soak_check(
 ) -> int:
     owner, repo = caller_repo.split("/", 1)
     default = client.get_repo(owner, repo).get("default_branch", "main")
+    # Only runs of the current head onward count: runs from before the pilot
+    # merge were produced by the old templates and prove nothing about the new.
+    # Run this AFTER merging the pilot PR; the head is printed so a soak
+    # started too early is visible.
+    head_sha, head_msg = client.branch_head(owner, repo, default)
+    print(f"soak: counting {caller_repo}@{default} runs from {head_sha[:8]} on ({head_msg})")
     deadline = time.time() + timeout_s
     while True:
-        if client.all_green(owner, repo, default, n=min_runs):
+        if client.all_green(owner, repo, default, n=min_runs, from_sha=head_sha):
             return 0
         if time.time() >= deadline:
             return 1

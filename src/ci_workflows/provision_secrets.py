@@ -1,9 +1,10 @@
 """provision_secrets.py — read .env.ci-secrets and PUT each secret to each caller.
 
-The `ALLOWED_SECRETS` allowlist makes CHAT_ID leak architecturally impossible:
+The `ALLOWED_SECRETS` allowlist keeps the chat ID out of per-repo secrets:
 even if a future operator drops `TELEGRAM_CI_CHAT_ID` into `.env`, this script
-refuses to provision it (chat_id is hardcoded in the notifier snippet —
-`templates/_snippets/notify_on_failure.yml`).
+refuses to provision it. The notifier snippet
+(`templates/_snippets/notify_on_failure.yml`) reads it from the repository- or
+organization-level Actions variable `vars.TELEGRAM_CHAT_ID` instead.
 """
 
 import argparse

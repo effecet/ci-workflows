@@ -1,14 +1,44 @@
       - name: Install dependencies
         run: |
-          # Only editable-install if this is actually a Python package. uv's own
-          # heuristic: a [project]/[build-system] table in pyproject.toml, OR a
-          # setup.py / setup.cfg. Config-only pyproject.toml (e.g. just
-          # [tool.pytest.ini_options]) is NOT a package — skip the editable install
-          # and rely on requirements*.txt. No `|| true`: a real package with a
-          # broken build still fails loudly.
-          if [ -f setup.py ] || [ -f setup.cfg ] || { [ -f pyproject.toml ] && grep -qE '^\[(project|build-system)\]' pyproject.toml; }; then
-            uv pip install -e '.[dev]' 2>/dev/null || uv pip install -e .
+          if [ -f uv.lock ]; then
+            # Lock present → reproducible, pinned install from the committed lock.
+            # --locked fails loud if uv.lock is out of sync with pyproject.toml; a
+            # stale lock must be re-locked by the consumer (`uv lock`), NOT silently
+            # used. --all-extras installs every
+            # [project.optional-dependencies] extra; --dev installs the dev
+            # dependency-group. Matches uv's canonical CI recipe.
+            uv sync --locked --all-extras --dev
+          else
+            # No lock → unchanged unlocked behavior (resolve-latest at run time).
+            # Only editable-install if this is actually a Python package (uv's
+            # heuristic: [project]/[build-system] table, or setup.py/setup.cfg).
+            if [ -f setup.py ] || [ -f setup.cfg ] || { [ -f pyproject.toml ] && grep -qE '^\[(project|build-system)\]' pyproject.toml; }; then
+              uv pip install -e '.[dev]' 2>/dev/null || uv pip install -e .
+            fi
+            if [ -f requirements.txt ]; then uv pip install -r requirements.txt; fi
+            if [ -f requirements-dev.txt ]; then uv pip install -r requirements-dev.txt; fi
           fi
-          if [ -f requirements.txt ]; then uv pip install -r requirements.txt; fi
-          if [ -f requirements-dev.txt ]; then uv pip install -r requirements-dev.txt; fi
-          uv pip install ruff pytest pytest-xdist
+          # Test tooling — always, AFTER the install branch so `uv sync`'s
+          # exact-match prune can't strip it.
+          #
+          # ruff is PINNED below 0.16 on purpose. Unpinned, every caller silently
+          # resolves whatever ruff is newest at run time, so a ruff release can
+          # break green repos that changed nothing. 0.16.0 did exactly that, twice
+          # over (verified head-to-head on a real caller's tracked files):
+          #
+          #   * `ruff format` began formatting Python code blocks inside Markdown
+          #     by default. 0.15.22 refuses ("Markdown formatting is experimental,
+          #     enable preview mode"); 0.16.1 reformats. Callers with code samples
+          #     in docs start failing the format gate.
+          #   * The default lint rule set expanded well past E4/E7/E9/F. Same files,
+          #     no config: 0.15.22 → "All checks passed!", 0.16.1 → 32 errors
+          #     (RET, PLR, PLW, RUF, I, S, DTZ, XE...).
+          #
+          # Moving to 0.16+ is a real migration (callers need `select` pinned and
+          # docs excluded), so it should be a deliberate release of this template,
+          # not a surprise from `uv pip install`. Bump this ceiling only alongside
+          # that migration.
+          #
+          # pytest/pytest-xdist remain unpinned — no observed breakage — but they
+          # carry the same latent risk if you ever need somewhere to look.
+          uv pip install 'ruff>=0.15,<0.16' pytest pytest-xdist

@@ -2,10 +2,11 @@
   if: failure()
   env:
     TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_CI_TOKEN }}
-    CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
   run: |
     set +e
     [ -z "$TELEGRAM_TOKEN" ] && { echo "⚠️ notify skip: TELEGRAM_CI_TOKEN missing"; exit 0; }
+    [ -z "$CHAT_ID" ] && { echo "⚠️ notify skip: vars.TELEGRAM_CHAT_ID missing"; [ -n "$GITHUB_STEP_SUMMARY" ] && echo "### ⚠️ Telegram notify skipped: repo/org variable TELEGRAM_CHAT_ID is not set" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
 
     esc() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
     REPO=$(esc "$GITHUB_REPOSITORY")
@@ -46,11 +47,12 @@
 
     HTTP_CODE=""
     for attempt in 1 2 3; do
-      HTTP_CODE=$(curl -sS --max-time 10 -o /tmp/tg_resp.json -w "%{http_code}" \
+      # URL (with the token) goes in on stdin via -K, so it never appears in argv / ps.
+      HTTP_CODE=$(printf 'url = "%s"\n' "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+        | curl -sS --max-time 10 -o /tmp/tg_resp.json -w "%{http_code}" -K - \
         --data-urlencode "chat_id=${CHAT_ID}" \
         --data-urlencode "text=${MSG}" \
-        -d "parse_mode=HTML" -d "disable_web_page_preview=true" \
-        "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage")
+        -d "parse_mode=HTML" -d "disable_web_page_preview=true")
       if [ "$HTTP_CODE" = "200" ]; then
         echo "✅ Telegram ping sent (attempt ${attempt})"
         break

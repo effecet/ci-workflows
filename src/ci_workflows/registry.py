@@ -14,34 +14,33 @@ TIER_JOBS = {
     "docs-static": frozenset({"lint-docs", "gitleaks-fast", "sweep"}),
 }
 
-DEFAULT_RUNS_ON = "codeberg-tiny"
+DEFAULT_RUNS_ON = "arm64-runner"
 
 # Per-tier-per-job runner defaults. Resolution order for `Caller.runs_on_for(job)`:
 #   1. Caller's explicit `runs_on` override (callers.yml)
 #   2. TIER_DEFAULTS[tier][job]                   ← this table
 #   3. DEFAULT_RUNS_ON                            ← global fallback
 #
-# 2026-05-12 architectural shift: every active per-push CI job runs on
-# `arm64-runner` (Pi 5 self-hosted). Capacity = 3 concurrent jobs TOTAL —
-# a single `runner.capacity: 3` shared across both server.connections,
-# NOT per-connection (corrected 2026-05-19, verified live from
-# /etc/forgejo-runner/config.yml; was wrongly "6 across two connections").
-# `codeberg-tiny` is reserved for the weekly background sweep cron (low
-# priority, fair-use-policy friendly) and any non-overridden default.
+# Per-push CI jobs run on the self-hosted `arm64-runner` label. Note that a
+# runner's `capacity` is one concurrency budget shared across all of its
+# server connections, not a per-connection limit.
 #
-# A heavy docs-static caller (e.g. a notebook-heavy repo) can opt INTO
-# arm64-runner via explicit `runs_on` — the tier default of codeberg-tiny
-# works for lightweight docs-static callers.
+# v3.3.0: nothing defaults to a hosted `codeberg-*` label any more. Hosted
+# runners carry their own usage policy (typically public FLOSS projects only,
+# and no pipelines that assist LLM-driven workflows), which a template cannot
+# know a caller meets. So the weekly sweep and docs-static lint-docs, the last
+# two jobs on `codeberg-tiny`, moved to the self-hosted arm64-runner. A caller
+# that qualifies can still opt into a hosted label with an explicit `runs_on`.
 TIER_DEFAULTS: dict[str, dict[str, str]] = {
     "python-app": {
         "lint-test": "arm64-runner",
         "gitleaks-fast": "arm64-runner",
-        "sweep": "codeberg-tiny",  # weekly cron, background
+        "sweep": "arm64-runner",  # weekly cron, background
     },
     "docs-static": {
-        "lint-docs": "codeberg-tiny",  # light READMEs; heavy callers override
+        "lint-docs": "arm64-runner",
         "gitleaks-fast": "arm64-runner",
-        "sweep": "codeberg-tiny",
+        "sweep": "arm64-runner",
     },
 }
 

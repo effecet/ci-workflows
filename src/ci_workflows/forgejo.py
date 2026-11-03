@@ -5,7 +5,8 @@ from typing import Any
 from urllib.parse import quote
 
 import requests
-from requests.exceptions import ConnectionError as ReqConnectionError, Timeout
+from requests.exceptions import ConnectionError as ReqConnectionError
+from requests.exceptions import Timeout
 
 
 class ForgejoError(RuntimeError):
@@ -94,19 +95,38 @@ class ForgejoClient:
 
     # --- workflow runs -----
 
-    def last_n_runs_on_branch(self, owner: str, repo: str, branch: str, *, n: int) -> list[dict]:
-        payload = self._request("GET", f"/repos/{owner}/{repo}/actions/runs")
+    def last_n_runs_on_branch(
+        self, owner: str, repo: str, branch: str, *, n: int, from_sha: str | None = None
+    ) -> list[dict]:
+        """The newest n runs whose ref is `branch`, newest first.
+
+        Forgejo on Codeberg sends no `head_branch` (raw API, verified 2026-11-01
+        on example-org/example-app and example-org/ci-workflows). The ref lives in
+        `prettyref`: the branch name for a push or schedule run, `#N` for a
+        pull_request run, so a PR run can never match a branch. The old "no
+        head_branch means this branch" fallback matched every run, so PR and
+        sync-branch runs passed a soak meant for the default branch.
+
+        With `from_sha`, only runs from the oldest run of that commit onward
+        count, and there are none until that commit has a run. Anchoring on a
+        run (Codeberg's clock) rather than the commit's timestamp holds for
+        fast-forward and rebase merges, whose commits keep their original time.
+        """
+        # limit+page: without `page` the API ignores `limit`; 50 is the max page,
+        # wide enough that a long soak's PR and sync-branch runs can't push the
+        # head's anchor run off the list.
+        payload = self._request("GET", f"/repos/{owner}/{repo}/actions/runs?limit=50&page=1")
         runs = payload.get("workflow_runs", []) if isinstance(payload, dict) else []
-        # Forgejo on Codeberg returns head_branch=null for push events (raw API, verified
-        # 2026-04-21 — the codeberg MCP coerces null to "", masking this). Tolerate both
-        # None and "" as "on the implicit branch of the push" since push events only
-        # fire on a single branch. Explicit branch names (PR head refs) still match
-        # strictly.
-        on_branch = [r for r in runs if r.get("head_branch") == branch or not r.get("head_branch")]
+        on_branch = sorted(
+            (r for r in runs if r.get("prettyref") == branch), key=lambda r: r.get("id", 0), reverse=True
+        )
+        if from_sha is not None:
+            anchors = [i for i, r in enumerate(on_branch) if r.get("commit_sha") == from_sha]
+            on_branch = on_branch[: anchors[-1] + 1] if anchors else []
         return on_branch[:n]
 
-    def all_green(self, owner: str, repo: str, branch: str, *, n: int) -> bool:
-        """Return True only if the last n runs on `branch` all succeeded.
+    def all_green(self, owner: str, repo: str, branch: str, *, n: int, from_sha: str | None = None) -> bool:
+        """Return True only if the last n runs on `branch` (from `from_sha` on) all succeeded.
 
         Returns False when fewer than n completed runs exist on the branch
         (e.g., a fresh caller that has not accumulated enough history yet).
@@ -114,10 +134,19 @@ class ForgejoClient:
         Forgejo on Codeberg uses `status` (not GitHub's `conclusion`) for the
         terminal outcome — "success" | "failure" | "running" | "queued".
         """
-        runs = self.last_n_runs_on_branch(owner, repo, branch, n=n)
+        runs = self.last_n_runs_on_branch(owner, repo, branch, n=n, from_sha=from_sha)
         if len(runs) < n:
             return False
         return all(r.get("status") == "success" for r in runs)
+
+    def branch_head(self, owner: str, repo: str, branch: str) -> tuple[str, str]:
+        """(sha, first line of message) of `branch`'s head commit."""
+        payload = self._request("GET", f"/repos/{owner}/{repo}/branches/{quote(branch, safe='')}")
+        commit = payload.get("commit") if isinstance(payload, dict) else None
+        if not isinstance(commit, dict) or not commit.get("id"):
+            raise ForgejoError(f"GET branches/{branch} → no commit id in response")
+        lines = (commit.get("message") or "").splitlines()
+        return commit["id"], lines[0] if lines else ""
 
     # --- branches + files (PR plumbing) -----
 
@@ -155,6 +184,34 @@ class ForgejoClient:
         (verified 2026-04-21 attempting to write .ci-workflows-version on example-app)."""
         body = {"content": content_b64, "message": message, "branch": branch}
         return self._request("POST", f"/repos/{owner}/{repo}/contents/{path}", json_body=body)
+
+    def change_files(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        branch: str,
+        message: str,
+        files: list[dict],
+    ) -> dict:
+        """Commit a batch of file operations in a SINGLE commit (repoChangeFiles).
+
+        Codeberg's Forgejo has no Git Data write API (POST /git/trees and
+        /git/commits are absent), but POST /contents accepts a `files` array whose
+        ops all land in one commit. Used by sync to avoid the multi-commit-per-sync
+        storm that left stale push-status failures blocking merge.
+
+        Each entry in `files`:
+            {"operation": "create" | "update" | "delete", "path": str,
+             "content": <base64 str, for create/update>,
+             "sha": <str, required for update/delete>}
+
+        `files` must be non-empty — Forgejo's repoChangeFiles requires it, and
+        sync always supplies at least the marker op. Rename (`from_path`/move) is
+        intentionally not modeled; sync never renames.
+        """
+        body = {"branch": branch, "message": message, "files": files}
+        return self._request("POST", f"/repos/{owner}/{repo}/contents", json_body=body)
 
     def list_dir(self, owner: str, repo: str, path: str, *, ref: str = "main") -> list[dict]:
         """List directory contents. Returns array of {name, type, sha, path} items.

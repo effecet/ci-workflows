@@ -8,6 +8,9 @@ from ci_workflows.forgejo import ForgejoError
 from ci_workflows.registry import Caller, load_registry
 from ci_workflows.sync import (
     RenderedCaller,
+    _plan_sweep_ops,
+    _plan_write_ops,
+    _upsert_op,
     fanout,
     plan_renders,
     probe_token_scope,
@@ -171,12 +174,21 @@ def test_sync_one_caller_force_refreshes_branch_and_opens_pr():
     rendered = _fake_rendered("example-org/alpha")
     pr = sync_one_caller(client, caller_repo="example-org/alpha", rendered=rendered, to_tag="v1")
     client.create_branch.assert_called_once()
-    # New files use POST (create_file); existing files use PUT with sha.
-    # Here all 3 files are new (get_file 404s), so 3 create_file, 0 put_file.
-    assert client.create_file.call_count == 3
-    assert client.put_file.call_count == 0
+    # One atomic batch commit; all 3 files are new -> all create ops.
+    client.change_files.assert_called_once()
+    files = client.change_files.call_args.kwargs["files"]
+    assert [f["operation"] for f in files] == ["create", "create", "create"]
+    assert {f["path"] for f in files} == {
+        ".ci-workflows-version",
+        ".github/workflows/ci.yml",
+        ".github/workflows/gitleaks-sweep.yml",
+    }
     client.create_pull.assert_called_once()
     assert pr["number"] == 42
+    # v3.2.1: the whole change set is ONE commit — never per-file writes.
+    for per_file in ("create_file", "put_file", "update_file", "delete_file"):
+        getattr(client, per_file).assert_not_called()
+    assert client.change_files.call_args.kwargs["message"] == "sync: bump to v1"
 
 
 def test_pr_title_includes_caller_short_name():
@@ -211,9 +223,11 @@ def test_sync_one_caller_reuses_existing_pr():
     client.list_pulls.return_value = [{"number": 9, "head": {"ref": "sync/v1"}, "html_url": "..."}]
     rendered = _fake_rendered("example-org/alpha")
     pr = sync_one_caller(client, caller_repo="example-org/alpha", rendered=rendered, to_tag="v1")
-    # All 3 files exist (get_file returns sha), so all 3 writes route to PUT, not POST.
-    assert client.put_file.call_count == 3
-    assert client.create_file.call_count == 0
+    # All files exist (get_file returns sha) -> all update ops in one batch.
+    client.change_files.assert_called_once()
+    files = client.change_files.call_args.kwargs["files"]
+    assert all(f["operation"] == "update" for f in files)
+    assert all("sha" in f for f in files)
     client.create_pull.assert_not_called()
     assert pr["number"] == 9
 
@@ -228,9 +242,10 @@ def test_sync_one_caller_skips_create_branch_if_exists():
     client.create_pull.return_value = {"number": 1, "html_url": "..."}
     rendered = _fake_rendered("example-org/alpha")
     sync_one_caller(client, caller_repo="example-org/alpha", rendered=rendered, to_tag="v1")
-    # Branch 409 swallowed; all 3 files are new (get_file 404s), so 3 create_file.
-    assert client.create_file.call_count == 3
-    assert client.put_file.call_count == 0
+    # Branch 409 swallowed; one atomic batch commit still issued.
+    client.change_files.assert_called_once()
+    files = client.change_files.call_args.kwargs["files"]
+    assert len(files) == 3 and all(f["operation"] == "create" for f in files)
 
 
 def test_sync_one_caller_sweeps_stale_workflows():
@@ -276,10 +291,10 @@ def test_sync_one_caller_sweeps_stale_workflows():
     client.create_pull.return_value = {"number": 7, "html_url": "..."}
     rendered = _fake_rendered("example-org/alpha")
     sync_one_caller(client, caller_repo="example-org/alpha", rendered=rendered, to_tag="v1")
-    # 4 deletions: 1 legacy in .github/workflows/ + 3 in .forgejo/workflows/
-    assert client.delete_file.call_count == 4
-    deleted_paths = [c.args[2] for c in client.delete_file.call_args_list]
-    assert set(deleted_paths) == {
+    # All deletions ride in the single batch as delete ops.
+    files = client.change_files.call_args.kwargs["files"]
+    deleted_paths = {f["path"] for f in files if f["operation"] == "delete"}
+    assert deleted_paths == {
         ".github/workflows/legacy-deploy.yml",
         ".forgejo/workflows/ruff.yml",
         ".forgejo/workflows/pytest.yml",
@@ -412,8 +427,8 @@ def test_rate_limit_cooldown_skips_sleep_on_failure(monkeypatch):
 
 
 def test_preserve_keeps_listed_workflows():
-    """A caller with preserve=("pi-smoke.yml",) → sweep deletes legacy-deploy.yml
-    but leaves pi-smoke.yml alone. Templated ci.yml + gitleaks-sweep.yml stay too.
+    """A caller with preserve=("smoke.yml",) → sweep deletes legacy-deploy.yml
+    but leaves smoke.yml alone. Templated ci.yml + gitleaks-sweep.yml stay too.
     """
     client = MagicMock()
     client.get_repo.return_value = {"default_branch": "main"}
@@ -426,16 +441,17 @@ def test_preserve_keeps_listed_workflows():
             return [
                 {"name": "ci.yml", "type": "file", "sha": "sha-ci"},  # templated
                 {"name": "gitleaks-sweep.yml", "type": "file", "sha": "sha-sweep"},  # templated
-                {"name": "pi-smoke.yml", "type": "file", "sha": "sha-pi"},  # preserved
+                {"name": "smoke.yml", "type": "file", "sha": "sha-smoke"},  # preserved
                 {"name": "legacy-deploy.yml", "type": "file", "sha": "sha-legacy"},  # deleted
             ]
         return []
 
     client.list_dir.side_effect = list_dir_mock
-    rendered = _fake_rendered("example-org/alpha", preserve=("pi-smoke.yml",))
+    rendered = _fake_rendered("example-org/alpha", preserve=("smoke.yml",))
     sync_one_caller(client, caller_repo="example-org/alpha", rendered=rendered, to_tag="v1")
 
-    deleted_paths = [c.args[2] for c in client.delete_file.call_args_list]
+    files = client.change_files.call_args.kwargs["files"]
+    deleted_paths = [f["path"] for f in files if f["operation"] == "delete"]
     assert deleted_paths == [".github/workflows/legacy-deploy.yml"], (
         f"expected only legacy-deploy.yml deleted, got {deleted_paths}"
     )
@@ -456,26 +472,41 @@ def test_preserve_only_applies_to_github_workflows_dir():
             return [
                 {"name": "ci.yml", "type": "file", "sha": "sha-ci"},
                 {"name": "gitleaks-sweep.yml", "type": "file", "sha": "sha-sweep"},
-                {"name": "pi-smoke.yml", "type": "file", "sha": "sha-pi"},  # preserved
+                {"name": "smoke.yml", "type": "file", "sha": "sha-smoke"},  # preserved
             ]
         if path == ".forgejo/workflows":
             return [
-                {"name": "pi-smoke.yml", "type": "file", "sha": "sha-pi-legacy"},  # SWEPT
+                {"name": "smoke.yml", "type": "file", "sha": "sha-smoke-legacy"},  # SWEPT
                 {"name": "old-build.yml", "type": "file", "sha": "sha-build"},
             ]
         return []
 
     client.list_dir.side_effect = list_dir_mock
-    rendered = _fake_rendered("example-org/alpha", preserve=("pi-smoke.yml",))
+    rendered = _fake_rendered("example-org/alpha", preserve=("smoke.yml",))
     sync_one_caller(client, caller_repo="example-org/alpha", rendered=rendered, to_tag="v1")
 
-    deleted_paths = {c.args[2] for c in client.delete_file.call_args_list}
-    # .github/workflows/pi-smoke.yml is preserved.
-    # .forgejo/workflows/pi-smoke.yml is swept (legacy dir, unconditional).
+    files = client.change_files.call_args.kwargs["files"]
+    deleted_paths = {f["path"] for f in files if f["operation"] == "delete"}
+    # .github/workflows/smoke.yml is preserved.
+    # .forgejo/workflows/smoke.yml is swept (legacy dir, unconditional).
     assert deleted_paths == {
-        ".forgejo/workflows/pi-smoke.yml",
+        ".forgejo/workflows/smoke.yml",
         ".forgejo/workflows/old-build.yml",
     }, f"expected only .forgejo files swept, got {deleted_paths}"
+
+
+def test_soak_check_only_counts_runs_from_default_branch_head(monkeypatch, capsys):
+    """Runs from before the pilot merge must not satisfy the soak."""
+    client = MagicMock()
+    client.all_green.return_value = True
+    client.get_repo.return_value = {"default_branch": "master"}
+    client.branch_head.return_value = ("a1b2c3d4abc", "Merge pull request #21")
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    rc = soak_check(client, caller_repo="example-org/example-app", min_runs=3, timeout_s=10, poll_s=1)
+    assert rc == 0
+    client.branch_head.assert_called_once_with("example-org", "example-app", "master")
+    client.all_green.assert_called_with("example-org", "example-app", "master", n=3, from_sha="a1b2c3d4abc")
+    assert "runs from a1b2c3d4 on (Merge pull request #21)" in capsys.readouterr().out
 
 
 def test_soak_check_exits_0_when_runs_already_green(monkeypatch):
@@ -483,6 +514,7 @@ def test_soak_check_exits_0_when_runs_already_green(monkeypatch):
     client.all_green.return_value = True
     client.get_repo.return_value = {"default_branch": "main"}
     monkeypatch.setattr("time.sleep", lambda _: None)
+    client.branch_head.return_value = ("abc1234", "head")
     rc = soak_check(client, caller_repo="example-org/example-app", min_runs=3, timeout_s=10, poll_s=1)
     assert rc == 0
 
@@ -492,6 +524,7 @@ def test_soak_check_polls_then_exits_on_green(monkeypatch):
     client.all_green.side_effect = [False, False, True]
     client.get_repo.return_value = {"default_branch": "main"}
     monkeypatch.setattr("time.sleep", lambda _: None)
+    client.branch_head.return_value = ("abc1234", "head")
     rc = soak_check(client, caller_repo="example-org/example-app", min_runs=3, timeout_s=10, poll_s=1)
     assert rc == 0
     assert client.all_green.call_count == 3
@@ -505,6 +538,7 @@ def test_soak_check_times_out_returns_1(monkeypatch):
     times = iter([1000.0, 1000.0, 1001.5])
     monkeypatch.setattr("time.time", lambda: next(times))
     monkeypatch.setattr("time.sleep", lambda _: None)
+    client.branch_head.return_value = ("abc1234", "head")
     rc = soak_check(client, caller_repo="example-org/example-app", min_runs=3, timeout_s=1, poll_s=1)
     assert rc == 1
 
@@ -543,10 +577,10 @@ def test_sync_one_caller_regenerates_stale_readme():
     rendered = _fake_rendered("example-org/example-app")
     sync_one_caller(client, caller_repo="example-org/example-app", rendered=rendered, to_tag="v2")
 
-    readme_calls = [c for c in client.put_file.call_args_list if c.kwargs.get("path") == "README.md"]
-    assert readme_calls, f"expected a put_file call targeting README.md, got {client.put_file.call_args_list}"
-    written_b64 = readme_calls[0].kwargs.get("content_b64")
-    written = base64.b64decode(written_b64).decode()
+    files = client.change_files.call_args.kwargs["files"]
+    readme_ops = [f for f in files if f["path"] == "README.md"]
+    assert readme_ops, f"expected a README.md op in the batch, got {[f['path'] for f in files]}"
+    written = base64.b64decode(readme_ops[0]["content"]).decode()
     assert "ci.yml/badge.svg" in written
     assert "gitleaks-sweep.yml/badge.svg" in written
     assert "ruff.yml/badge" not in written
@@ -574,8 +608,9 @@ def test_sync_one_caller_skips_readme_write_when_canonical():
         rendered=_fake_rendered("example-org/example-app"),
         to_tag="v2",
     )
-    readme_calls = [c for c in client.put_file.call_args_list if c.kwargs.get("path") == "README.md"]
-    assert not readme_calls, f"expected no README.md write for idempotent canonical README; got {readme_calls}"
+    files = client.change_files.call_args.kwargs["files"]
+    readme_ops = [f for f in files if f["path"] == "README.md"]
+    assert not readme_ops, f"expected no README.md op for idempotent canonical README; got {readme_ops}"
 
 
 def test_sync_one_caller_handles_missing_readme():
@@ -593,5 +628,79 @@ def test_sync_one_caller_handles_missing_readme():
         rendered=_fake_rendered("example-org/no-readme"),
         to_tag="v2",
     )
-    readme_calls = [c for c in client.put_file.call_args_list if c.kwargs.get("path") == "README.md"]
-    assert not readme_calls, "README write must not happen if README.md doesn't exist"
+    files = client.change_files.call_args.kwargs["files"]
+    readme_ops = [f for f in files if f["path"] == "README.md"]
+    assert not readme_ops, "README op must not be in the batch if README.md doesn't exist"
+
+
+def test_plan_sweep_ops_returns_delete_ops_excluding_templated_and_preserved():
+    client = MagicMock()
+
+    def list_dir(owner, repo, path, *, ref):
+        if path == ".github/workflows":
+            return [
+                {"name": "ci.yml", "type": "file", "sha": "s-ci"},  # templated -> keep
+                {"name": "gitleaks-sweep.yml", "type": "file", "sha": "s-sw"},  # templated -> keep
+                {"name": "smoke.yml", "type": "file", "sha": "s-smoke"},  # preserved -> keep
+                {"name": "legacy-deploy.yml", "type": "file", "sha": "s-leg"},  # -> DELETE
+            ]
+        if path == ".forgejo/workflows":
+            return [{"name": "old.yml", "type": "file", "sha": "s-old"}]  # legacy -> DELETE
+        return []
+
+    client.list_dir.side_effect = list_dir
+    ops = _plan_sweep_ops(client, "example-org", "alpha", branch="sync/v1", preserve=frozenset({"smoke.yml"}))
+    assert all(o["operation"] == "delete" for o in ops)
+    paths = {o["path"] for o in ops}
+    assert paths == {".github/workflows/legacy-deploy.yml", ".forgejo/workflows/old.yml"}
+    assert all("sha" in o for o in ops)
+    client.delete_file.assert_not_called()
+
+
+def test_upsert_op_creates_when_absent_updates_when_present():
+    client = MagicMock()
+    client.get_file.side_effect = ForgejoError("404")
+    op = _upsert_op(client, "example-org", "alpha", branch="sync/v1", path="x.yml", content="hi\n")
+    assert op["operation"] == "create"
+    assert op["path"] == "x.yml"
+    assert base64.b64decode(op["content"]).decode() == "hi\n"
+    assert "sha" not in op
+
+    client.get_file.side_effect = None
+    client.get_file.return_value = {"sha": "abc123"}
+    op2 = _upsert_op(client, "example-org", "alpha", branch="sync/v1", path="x.yml", content="hi\n")
+    assert op2["operation"] == "update"
+    assert op2["sha"] == "abc123"
+
+
+def test_plan_write_ops_marker_and_rendered_skip_readme_when_absent():
+    client = MagicMock()
+    client.get_file.side_effect = ForgejoError("404")  # nothing exists yet (incl. README)
+    rendered = _fake_rendered("example-org/alpha")
+    ops = _plan_write_ops(client, "example-org", "alpha", branch="sync/v1", rendered=rendered)
+    paths = [o["path"] for o in ops]
+    assert paths == [
+        ".ci-workflows-version",
+        ".github/workflows/ci.yml",
+        ".github/workflows/gitleaks-sweep.yml",
+    ]
+    assert all(o["operation"] == "create" for o in ops)  # README 404 -> not included
+
+
+def test_plan_write_ops_includes_readme_update_when_badges_change():
+    client = MagicMock()
+    stale = "# alpha\n[![ci](https://example/old.svg)](https://example/old)\n"
+
+    def get_file(owner, repo, path, *, ref):
+        if path == "README.md":
+            return {"sha": "r-sha", "content": base64.b64encode(stale.encode()).decode()}
+        raise ForgejoError("404")
+
+    client.get_file.side_effect = get_file
+    rendered = _fake_rendered("example-org/alpha")
+    ops = _plan_write_ops(client, "example-org", "alpha", branch="sync/v1", rendered=rendered)
+    readme_ops = [o for o in ops if o["path"] == "README.md"]
+    assert len(readme_ops) == 1
+    assert readme_ops[0]["operation"] == "update"
+    assert readme_ops[0]["sha"] == "r-sha"
+    assert "actions/workflows/ci.yml/badge.svg" in base64.b64decode(readme_ops[0]["content"]).decode()

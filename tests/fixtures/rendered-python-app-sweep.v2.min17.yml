@@ -9,34 +9,46 @@ on:
 
 jobs:
   sweep:
-    runs-on: codeberg-tiny
+    runs-on: arm64-runner
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0     # full history — this is the sweep
-      - name: Gitleaks (full history)
+      - name: Ensure gitleaks (baked, else retry-curl)
         run: |
-          # Cross-arch: gitleaks publishes linux_x64 + linux_arm64 tarballs.
-          # `uname -m` returns aarch64 on ARM (Pi/Graviton) and x86_64 on x64.
+          # Same block as gitleaks-fast: a runner image with gitleaks 8.30.1
+          # baked in needs ZERO network. Any
+          # other runner: retry-wrapped (3x, backoff) curl of the pinned static
+          # binary. Cross-arch: uname -m -> aarch64 on ARM, x86_64 on x64.
+          if command -v gitleaks >/dev/null 2>&1; then exit 0; fi
           case "$(uname -m)" in
             aarch64|arm64) GL_ARCH=arm64 ;;
             x86_64|amd64)  GL_ARCH=x64 ;;
             *)             echo "unsupported arch: $(uname -m)"; exit 2 ;;
           esac
-          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_${GL_ARCH}.tar.gz" \
-            | tar -xz -C /tmp gitleaks
+          for i in 1 2 3; do
+            if curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_${GL_ARCH}.tar.gz" \
+              | tar -xz -C /usr/local/bin gitleaks; then
+              exit 0
+            fi
+            sleep $((i * 5))
+          done
+          echo "gitleaks unavailable after retries"; exit 1
+      - name: Gitleaks (full history)
+        run: |
           CONFIG_ARGS=()
           if [ -f .gitleaks.toml ]; then CONFIG_ARGS+=(--config .gitleaks.toml); fi
-          /tmp/gitleaks detect "${CONFIG_ARGS[@]}" --source . --exit-code 1 --verbose
+          gitleaks detect "${CONFIG_ARGS[@]}" --source . --exit-code 1 --verbose
 
       - name: Notify on failure
         if: failure()
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_CI_TOKEN }}
-          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
         run: |
           set +e
           [ -z "$TELEGRAM_TOKEN" ] && { echo "⚠️ notify skip: TELEGRAM_CI_TOKEN missing"; exit 0; }
+          [ -z "$CHAT_ID" ] && { echo "⚠️ notify skip: vars.TELEGRAM_CHAT_ID missing"; [ -n "$GITHUB_STEP_SUMMARY" ] && echo "### ⚠️ Telegram notify skipped: repo/org variable TELEGRAM_CHAT_ID is not set" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
 
           esc() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
           REPO=$(esc "$GITHUB_REPOSITORY")
@@ -77,11 +89,12 @@ jobs:
 
           HTTP_CODE=""
           for attempt in 1 2 3; do
-            HTTP_CODE=$(curl -sS --max-time 10 -o /tmp/tg_resp.json -w "%{http_code}" \
+            # URL (with the token) goes in on stdin via -K, so it never appears in argv / ps.
+            HTTP_CODE=$(printf 'url = "%s"\n' "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+              | curl -sS --max-time 10 -o /tmp/tg_resp.json -w "%{http_code}" -K - \
               --data-urlencode "chat_id=${CHAT_ID}" \
               --data-urlencode "text=${MSG}" \
-              -d "parse_mode=HTML" -d "disable_web_page_preview=true" \
-              "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage")
+              -d "parse_mode=HTML" -d "disable_web_page_preview=true")
             if [ "$HTTP_CODE" = "200" ]; then
               echo "✅ Telegram ping sent (attempt ${attempt})"
               break

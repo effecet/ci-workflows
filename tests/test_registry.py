@@ -2,7 +2,15 @@ from pathlib import Path
 
 import pytest
 
-from ci_workflows.registry import Caller, RegistryError, load_registry
+from ci_workflows import registry
+from ci_workflows.registry import (
+    DEFAULT_RUNS_ON,
+    TIER_DEFAULTS,
+    TIER_JOBS,
+    Caller,
+    RegistryError,
+    load_registry,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -90,26 +98,25 @@ def test_load_registry_rejects_non_bool_retry_setup(tmp_path):
 
 
 def test_runs_on_uses_tier_defaults_when_no_override():
-    """Tier-defaults: python-app lint-test+gitleaks default to arm64-runner,
-    sweep stays codeberg-tiny. docs-static: only gitleaks-fast moves to arm64-runner.
-    Verifies the 2026-05-12 architectural shift to arm64-runner-by-default.
+    """Every tier-default job runs on arm64-runner: no job defaults to a
+    hosted `codeberg-*` label (v3.3.0: hosted runners have their own usage policy).
     """
     py = Caller(repo="example-org/x", tier="python-app")
     assert py.runs_on_for("lint-test") == "arm64-runner"
     assert py.runs_on_for("gitleaks-fast") == "arm64-runner"
-    assert py.runs_on_for("sweep") == "codeberg-tiny"
+    assert py.runs_on_for("sweep") == "arm64-runner"
 
     docs = Caller(repo="example-org/y", tier="docs-static")
-    assert docs.runs_on_for("lint-docs") == "codeberg-tiny"  # light by default
+    assert docs.runs_on_for("lint-docs") == "arm64-runner"
     assert docs.runs_on_for("gitleaks-fast") == "arm64-runner"
-    assert docs.runs_on_for("sweep") == "codeberg-tiny"
+    assert docs.runs_on_for("sweep") == "arm64-runner"
 
 
 def test_runs_on_falls_back_to_global_default_for_unknown_job():
     """If a job isn't in TIER_DEFAULTS (e.g. a new job added but tier-default
     not yet wired), DEFAULT_RUNS_ON applies."""
     c = Caller(repo="example-org/x", tier="python-app")
-    assert c.runs_on_for("nonexistent-job") == "codeberg-tiny"
+    assert c.runs_on_for("nonexistent-job") == "arm64-runner"
 
 
 def test_runs_on_returns_override_when_set():
@@ -122,8 +129,8 @@ def test_runs_on_returns_override_when_set():
     # Explicit overrides win
     assert c.runs_on_for("lint-test") == "codeberg-medium"
     assert c.runs_on_for("gitleaks-fast") == "codeberg-medium"
-    # No override on sweep → tier-default applies (codeberg-tiny for python-app sweep)
-    assert c.runs_on_for("sweep") == "codeberg-tiny"
+    # No override on sweep → tier-default applies (arm64-runner for python-app sweep)
+    assert c.runs_on_for("sweep") == "arm64-runner"
 
 
 def test_load_registry_parses_runs_on(tmp_path):
@@ -142,7 +149,7 @@ def test_load_registry_parses_runs_on(tmp_path):
     c = reg.callers[0]
     assert c.runs_on_for("lint-test") == "codeberg-medium"
     assert c.runs_on_for("gitleaks-fast") == "arm64-runner"
-    assert c.runs_on_for("sweep") == "codeberg-tiny"
+    assert c.runs_on_for("sweep") == "arm64-runner"
 
 
 def test_load_registry_rejects_unknown_runs_on_job(tmp_path):
@@ -222,12 +229,12 @@ def test_load_registry_parses_preserve_list(tmp_path):
         "    tier: python-app\n"
         "    pilot: true\n"
         "    preserve:\n"
-        "      - pi-smoke.yml\n"
+        "      - smoke.yml\n"
         "      - internal-deploy.yaml\n"
     )
     reg = load_registry(p)
     # Stored as sorted tuple for hashability.
-    assert reg.callers[0].preserve == ("internal-deploy.yaml", "pi-smoke.yml")
+    assert reg.callers[0].preserve == ("internal-deploy.yaml", "smoke.yml")
 
 
 def test_load_registry_rejects_non_list_preserve(tmp_path):
@@ -239,7 +246,7 @@ def test_load_registry_rejects_non_list_preserve(tmp_path):
         "  - repo: example-org/x\n"
         "    tier: python-app\n"
         "    pilot: true\n"
-        "    preserve: pi-smoke.yml\n"  # scalar, not list
+        "    preserve: smoke.yml\n"  # scalar, not list
     )
     with pytest.raises(RegistryError, match="preserve.*must be a list"):
         load_registry(p)
@@ -319,3 +326,26 @@ def test_load_registry_handles_null_preserve(tmp_path):
     )
     reg = load_registry(p)
     assert reg.callers[0].preserve == ()
+
+
+def test_tier_default_wins_over_global_fallback(monkeypatch):
+    """TIER_DEFAULTS and DEFAULT_RUNS_ON are both arm64-runner, so a test on real
+    values cannot tell which one answered. A sentinel fallback can."""
+    monkeypatch.setattr(registry, "DEFAULT_RUNS_ON", "sentinel-fallback")
+    c = Caller(repo="example-org/x", tier="docs-static")
+    assert c.runs_on_for("lint-docs") == TIER_DEFAULTS["docs-static"]["lint-docs"]
+    assert c.runs_on_for("nonexistent-job") == "sentinel-fallback"
+
+
+def test_every_tier_job_has_a_tier_default():
+    """A job missing from TIER_DEFAULTS silently falls through to DEFAULT_RUNS_ON."""
+    for tier, jobs in TIER_JOBS.items():
+        assert set(TIER_DEFAULTS[tier]) == set(jobs), tier
+
+
+def test_no_default_is_a_codeberg_hosted_label():
+    """Hosted `codeberg-*` runners are for public FLOSS projects only
+    under the host's usage policy, which a template can't verify, so a hosted
+    label must be an explicit per-caller opt-in, never a default."""
+    labels = [DEFAULT_RUNS_ON] + [v for jobs in TIER_DEFAULTS.values() for v in jobs.values()]
+    assert [label for label in labels if label.startswith("codeberg-")] == []
