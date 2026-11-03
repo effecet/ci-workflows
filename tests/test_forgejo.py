@@ -157,28 +157,93 @@ def test_last_n_runs_on_branch_filters_by_branch_and_status():
     payload = json.loads((RESP / "tasks_list_green.json").read_text())
     with patch.object(client._session, "request", return_value=_mock_response(200, payload)):
         runs = client.last_n_runs_on_branch("example-org", "ci-workflows", "main", n=3)
-    assert len(runs) == 3
-    assert all(r["head_branch"] == "main" for r in runs)
-    assert all(r["status"] == "success" for r in runs)
+    assert [r["id"] for r in runs] == [103, 102, 101]
 
 
-def test_last_n_runs_on_branch_tolerates_empty_head_branch():
-    """Forgejo on Codeberg returns head_branch=null for push events (verified via raw
-    API 2026-04-21 on /repos/example-org/ci-workflows/actions/runs). The MCP coerces null to
-    "" — my client must tolerate BOTH None and "" as "matches the asked-for branch"
-    since push events only fire on a single branch anyway.
+def test_last_n_runs_on_branch_excludes_pr_and_other_branch_pushes():
+    """Codeberg sends no head_branch at all; the branch is `prettyref` (`#N` for a PR).
+
+    Raw GET /repos/example-org/example-app/actions/runs, 2026-11-01: run #199 push
+    prettyref=master, #198 pull_request prettyref=#21, #197 push
+    prettyref=sync/v3.3.1. The old `not head_branch` fallback counted all three as
+    master, so the v3.3.1 soak passed on one real master run.
     """
     client = ForgejoClient(base_url="https://codeberg.org", token="tok")
     payload = {
         "workflow_runs": [
-            {"id": 1, "head_branch": None, "status": "success"},  # raw API shape
-            {"id": 2, "head_branch": "", "status": "success"},  # MCP-coerced shape
-            {"id": 3, "head_branch": "dev", "status": "success"},
+            {"id": 199, "event": "push", "prettyref": "master", "status": "success"},
+            {"id": 198, "event": "pull_request", "prettyref": "#21", "status": "success"},
+            {"id": 197, "event": "push", "prettyref": "sync/v3.3.1", "status": "success"},
+            {"id": 196, "event": "push", "head_branch": None, "status": "success"},
+            {"id": 194, "event": "push", "head_branch": "master", "status": "success"},
+            {"id": 195, "event": "push", "prettyref": "master", "status": "success"},
         ]
     }
     with patch.object(client._session, "request", return_value=_mock_response(200, payload)):
-        runs = client.last_n_runs_on_branch("example-org", "ci-workflows", "main", n=5)
-    assert [r["id"] for r in runs] == [1, 2]
+        runs = client.last_n_runs_on_branch("example-org", "example-app", "master", n=5)
+    # No ref at all, or only the never-sent head_branch, is not "on master";
+    # and the result is newest first even when the API lists out of order.
+    assert [r["id"] for r in runs] == [199, 195]
+
+
+# example-app master after the v3.3.1 pilot merge (raw API, 2026-11-01).
+_PILOT_RUNS = {
+    "workflow_runs": [
+        {"id": 200, "event": "push", "prettyref": "master", "commit_sha": "a1b2c3d4", "status": "success"},
+        {"id": 199, "event": "push", "prettyref": "master", "commit_sha": "a1b2c3d4", "status": "success"},
+        {"id": 198, "event": "pull_request", "prettyref": "#21", "commit_sha": "b2c3d4e5", "status": "success"},
+        {"id": 195, "event": "push", "prettyref": "master", "commit_sha": "c3d4e5f6", "status": "success"},
+    ]
+}
+
+
+def test_from_sha_counts_only_runs_from_the_heads_first_run_on():
+    client = ForgejoClient(base_url="https://codeberg.org", token="tok")
+    with patch.object(client._session, "request", return_value=_mock_response(200, _PILOT_RUNS)):
+        runs = client.last_n_runs_on_branch("example-org", "example-app", "master", n=5, from_sha="a1b2c3d4")
+        assert [r["id"] for r in runs] == [200, 199]
+        # Run #195 is pre-merge (old templates): 3 green must not pass yet.
+        assert client.all_green("example-org", "example-app", "master", n=3, from_sha="a1b2c3d4") is False
+        assert client.all_green("example-org", "example-app", "master", n=2, from_sha="a1b2c3d4") is True
+
+
+def test_from_sha_with_no_run_yet_counts_nothing():
+    """A head with no run yet (CI not started) must not fall back to older runs."""
+    client = ForgejoClient(base_url="https://codeberg.org", token="tok")
+    with patch.object(client._session, "request", return_value=_mock_response(200, _PILOT_RUNS)):
+        assert client.last_n_runs_on_branch("example-org", "example-app", "master", n=5, from_sha="ffffffff") == []
+        assert client.all_green("example-org", "example-app", "master", n=1, from_sha="ffffffff") is False
+
+
+def test_last_n_runs_on_branch_requests_a_full_page():
+    """Without `page` the API ignores `limit`; a short default page lets a long
+    soak's PR runs push the head's anchor run off the list."""
+    client = ForgejoClient(base_url="https://codeberg.org", token="tok")
+    with patch.object(client._session, "request", return_value=_mock_response(200, {"workflow_runs": []})) as req:
+        client.last_n_runs_on_branch("example-org", "example-app", "master", n=3)
+    assert req.call_args.kwargs["url"].endswith("/repos/example-org/example-app/actions/runs?limit=50&page=1")
+
+
+def test_branch_head_with_empty_message_returns_empty_subject():
+    client = ForgejoClient(base_url="https://codeberg.org", token="tok")
+    payload = {"name": "master", "commit": {"id": "a1b2c3d4", "message": ""}}
+    with patch.object(client._session, "request", return_value=_mock_response(200, payload)):
+        assert client.branch_head("example-org", "example-app", "master") == ("a1b2c3d4", "")
+
+
+def test_branch_head_returns_sha_and_subject():
+    client = ForgejoClient(base_url="https://codeberg.org", token="tok")
+    payload = {"name": "master", "commit": {"id": "a1b2c3d4", "message": "Merge pull request #21\n\nbody"}}
+    with patch.object(client._session, "request", return_value=_mock_response(200, payload)) as req:
+        assert client.branch_head("example-org", "example-app", "master") == ("a1b2c3d4", "Merge pull request #21")
+    assert req.call_args.kwargs["url"].endswith("/repos/example-org/example-app/branches/master")
+
+
+def test_branch_head_without_commit_raises_forgejo_error():
+    client = ForgejoClient(base_url="https://codeberg.org", token="tok")
+    with patch.object(client._session, "request", return_value=_mock_response(200, {"name": "master"})):
+        with pytest.raises(ForgejoError, match="no commit id"):
+            client.branch_head("example-org", "example-app", "master")
 
 
 def test_all_green_returns_true_for_all_success():
@@ -193,3 +258,19 @@ def test_all_green_returns_false_if_any_failed():
     payload = json.loads((RESP / "tasks_list_red.json").read_text())
     with patch.object(client._session, "request", return_value=_mock_response(200, payload)):
         assert client.all_green("example-org", "ci-workflows", "main", n=2) is False
+
+
+def test_change_files_posts_batch_to_contents():
+    client = ForgejoClient(base_url="https://codeberg.org", token="tok")
+    files = [
+        {"operation": "create", "path": ".ci-workflows-version", "content": "eA=="},
+        {"operation": "update", "path": ".github/workflows/ci.yml", "content": "eA==", "sha": "abc"},
+        {"operation": "delete", "path": ".forgejo/workflows/legacy.yml", "sha": "def"},
+    ]
+    with patch.object(client._session, "request", return_value=_mock_response(201, {"commit": {"sha": "z"}})) as req:
+        got = client.change_files("example-org", "alpha", branch="sync/v1", message="sync: bump to v1", files=files)
+    assert got["commit"]["sha"] == "z"
+    _, kwargs = req.call_args
+    assert kwargs["method"] == "POST"
+    assert kwargs["url"].endswith("/repos/example-org/alpha/contents")
+    assert kwargs["json"] == {"branch": "sync/v1", "message": "sync: bump to v1", "files": files}

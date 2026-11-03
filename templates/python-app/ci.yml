@@ -37,7 +37,7 @@ jobs:
           fetch-depth: 1
       - name: Ensure gitleaks (baked, else retry-curl)
         run: |
-          # arm64-runner bakes gitleaks 8.30.1 into pi-ci-runner:v3.1 — use it
+          # a runner image with gitleaks 8.30.1 baked in — use it
           # with ZERO network. Any other runner: retry-wrapped (3×, backoff)
           # curl of the pinned static binary. Cross-arch: gitleaks publishes
           # linux_x64 + linux_arm64; uname -m → aarch64 on ARM, x86_64 on x64.
@@ -48,8 +48,11 @@ jobs:
             *)             echo "unsupported arch: $(uname -m)"; exit 2 ;;
           esac
           for i in 1 2 3; do
-            curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_${GL_ARCH}.tar.gz" \
-              | tar -xz -C /usr/local/bin gitleaks && exit 0; sleep $((i * 5))
+            if curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_${GL_ARCH}.tar.gz" \
+              | tar -xz -C /usr/local/bin gitleaks; then
+              exit 0
+            fi
+            sleep $((i * 5))
           done
           echo "gitleaks unavailable after retries"; exit 1
       - name: Gitleaks (no-git, PR diff only)

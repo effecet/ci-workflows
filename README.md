@@ -61,7 +61,6 @@ flowchart TB
 | `callers.yml` | registry of caller repos with tier + per-job runner overrides |
 | `src/ci_workflows/` | Python package: `registry`, `render`, `forgejo`, `sync`, `drift`, `provision_secrets` |
 | `tests/` | pytest suite (golden-file fixtures for templates + mocked Forgejo responses) |
-| `bot/` | optional self-hosted-runner Telegram notifier (script + systemd unit) |
 
 ## Quick start
 
@@ -98,7 +97,12 @@ smears callers across an hour so a shared runner pool isn't hit all at once.
 
 ### Per-caller `runs_on` override
 
-Default runner per job comes from the tier. Override per-job in `callers.yml`:
+Default runner per job comes from the tier (`registry.py:TIER_DEFAULTS`). Since
+v3.3.0 every job defaults to the self-hosted `arm64-runner` label: hosted
+`codeberg-*` labels carry their own usage policy (typically public FLOSS projects
+only, no pipelines that assist LLM-driven workflows), which a template can't
+check for you, so a hosted label is an explicit opt-in. Override per-job in
+`callers.yml`:
 
 ```yaml
 - repo: example-org/example-python-app
@@ -127,7 +131,13 @@ By default `sync.py` sweeps every non-templated `*.yml` under a caller's
 ### Install backend — lessons learned
 
 The `python-app` tier installs dependencies via [`uv`](https://github.com/astral-sh/uv):
-a shell install of `uv`, then `uv python install 3.12`, then a per-job venv. The
+a shell install of `uv`, then `uv python install 3.12`, then a per-job venv.
+Since v3.2.0 the install is **lock-aware**: if the caller commits a `uv.lock`, it
+runs `uv sync --locked --all-extras --dev`, which installs exactly the locked set
+and fails loudly when the lock is out of sync with `pyproject.toml` (re-lock with
+`uv lock`). Without a lock, the path below applies. Since v3.2.2 the snippet also pins
+`ruff>=0.15,<0.16` for callers: 0.16 changed `ruff format` and the default lint
+rule set, which turned unchanged repos red. The
 editable install (`uv pip install -e .`) is **guarded** — it only runs if the repo
 is actually a package (a `[project]`/`[build-system]` table in `pyproject.toml`, or
 a `setup.py`/`setup.cfg`); a config-only `pyproject.toml` falls back to
@@ -144,6 +154,20 @@ A few hard-won notes from running this in production:
   (e.g. just `[tool.pytest.ini_options]`) is not a package and will fail
   setuptools auto-discovery. Guard on package-ness.
 
+### One commit per sync
+
+Since v3.2.1 `sync.py` writes each caller's whole change set (rendered
+workflows, swept leftovers, the version marker) as **one** commit through the
+batch contents API, instead of a commit per file. A caller's CI runs once per
+sync, not once per file, so a half-applied sync can't trigger a storm of runs
+on intermediate states.
+
+`make soak`, run **after** merging the pilot PR, counts only default-branch runs
+from the branch's current head commit onward; PR and sync-branch runs don't
+count. Until that commit has a run, nothing counts, so the soak waits rather
+than passing on older history (and times out if the host never reports a ref
+for its runs).
+
 ### Fanout pacing
 
 Some hosts silently throttle burst PR creation. For large fanouts, pass
@@ -151,17 +175,21 @@ Some hosts silently throttle burst PR creation. For large fanouts, pass
 name in each PR title to avoid "similar title" anti-spam. `make fanout` sets a
 conservative default — override with `make fanout RATE_LIMIT_COOLDOWN=0`.
 
-## Self-hosted runner (optional)
+## Self-hosted runner
 
-The rendered jobs run on whatever runner label you set (`ubuntu-latest` by
-default on GitHub). If you add a self-hosted runner (e.g. an ARM64 box), give it
-a label and target it per-job via `runs_on:`. A practical strategy: keep the
-single source of truth for green-on-PR on a hosted runner, and use a self-hosted
-runner as a **parallel** secondary signal (architecture coverage, no shared-pool
-contention) rather than a replacement. The optional [`bot/`](./bot/README.md)
-notifier posts a Telegram message on job pickup for a self-hosted runner — set
-`TELEGRAM_CI_TOKEN` and `TELEGRAM_CHAT_ID` as secrets to use it (it's a no-op if
-the token is unset).
+The rendered jobs run on whatever runner label you set: the tier default
+(`arm64-runner`, see above) or a per-job `runs_on:`. If you add a self-hosted
+runner (e.g. an ARM64 box), give it that label, or target your own label
+per-job. Since v3.3.0 the self-hosted label is the default for every job; a
+hosted runner is a per-job `runs_on:` override for callers that meet its usage
+policy.
+
+Rendered workflows can post a Telegram message when a job fails: since v3.3.1
+the notification reads the bot token from the `TELEGRAM_CI_TOKEN` secret
+and the chat ID from a `TELEGRAM_CHAT_ID` Actions **variable** (repository or
+organization level; not a secret, and never a literal in the caller). It skips
+with a step-summary warning when either is unset, so a missing variable silences
+alerts without failing CI.
 
 ## Contributing
 

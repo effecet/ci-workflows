@@ -6,7 +6,7 @@ on: [push, pull_request]
 
 jobs:
   lint-docs:
-    runs-on: codeberg-tiny
+    runs-on: arm64-runner
     steps:
       - uses: actions/checkout@v4
 
@@ -17,11 +17,12 @@ jobs:
 
       - name: markdownlint-cli2
         run: |
-          npm install -g markdownlint-cli2@0.13.0
+          npm install -g --ignore-scripts markdownlint-cli2@0.13.0
           markdownlint-cli2 "**/*.md" "#node_modules" "#.git" || true
 
       - name: Lychee link-check
-        uses: https://github.com/lycheeverse/lychee-action@v2
+        # Pinned to a commit, not the movable v2 tag: this runs on a self-hosted runner. v2.9.0.
+        uses: https://github.com/lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8
         with:
           args: --accept 200,403,429 --max-concurrency 4 --timeout 20 './**/*.md'
           fail: false
@@ -30,10 +31,11 @@ jobs:
         if: failure()
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_CI_TOKEN }}
-          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
         run: |
           set +e
           [ -z "$TELEGRAM_TOKEN" ] && { echo "⚠️ notify skip: TELEGRAM_CI_TOKEN missing"; exit 0; }
+          [ -z "$CHAT_ID" ] && { echo "⚠️ notify skip: vars.TELEGRAM_CHAT_ID missing"; [ -n "$GITHUB_STEP_SUMMARY" ] && echo "### ⚠️ Telegram notify skipped: repo/org variable TELEGRAM_CHAT_ID is not set" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
 
           esc() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
           REPO=$(esc "$GITHUB_REPOSITORY")
@@ -74,11 +76,12 @@ jobs:
 
           HTTP_CODE=""
           for attempt in 1 2 3; do
-            HTTP_CODE=$(curl -sS --max-time 10 -o /tmp/tg_resp.json -w "%{http_code}" \
+            # URL (with the token) goes in on stdin via -K, so it never appears in argv / ps.
+            HTTP_CODE=$(printf 'url = "%s"\n' "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+              | curl -sS --max-time 10 -o /tmp/tg_resp.json -w "%{http_code}" -K - \
               --data-urlencode "chat_id=${CHAT_ID}" \
               --data-urlencode "text=${MSG}" \
-              -d "parse_mode=HTML" -d "disable_web_page_preview=true" \
-              "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage")
+              -d "parse_mode=HTML" -d "disable_web_page_preview=true")
             if [ "$HTTP_CODE" = "200" ]; then
               echo "✅ Telegram ping sent (attempt ${attempt})"
               break
@@ -109,7 +112,7 @@ jobs:
           fetch-depth: 1
       - name: Ensure gitleaks (baked, else retry-curl)
         run: |
-          # arm64-runner bakes gitleaks 8.30.1 into pi-ci-runner:v3.1 — use it
+          # a runner image with gitleaks 8.30.1 baked in — use it
           # with ZERO network. Any other runner: retry-wrapped (3×, backoff)
           # curl of the pinned static binary. Cross-arch: gitleaks publishes
           # linux_x64 + linux_arm64; uname -m → aarch64 on ARM, x86_64 on x64.
@@ -120,8 +123,11 @@ jobs:
             *)             echo "unsupported arch: $(uname -m)"; exit 2 ;;
           esac
           for i in 1 2 3; do
-            curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_${GL_ARCH}.tar.gz" \
-              | tar -xz -C /usr/local/bin gitleaks && exit 0; sleep $((i * 5))
+            if curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_${GL_ARCH}.tar.gz" \
+              | tar -xz -C /usr/local/bin gitleaks; then
+              exit 0
+            fi
+            sleep $((i * 5))
           done
           echo "gitleaks unavailable after retries"; exit 1
       - name: Gitleaks (no-git, PR diff only)
@@ -136,10 +142,11 @@ jobs:
         if: failure()
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_CI_TOKEN }}
-          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
         run: |
           set +e
           [ -z "$TELEGRAM_TOKEN" ] && { echo "⚠️ notify skip: TELEGRAM_CI_TOKEN missing"; exit 0; }
+          [ -z "$CHAT_ID" ] && { echo "⚠️ notify skip: vars.TELEGRAM_CHAT_ID missing"; [ -n "$GITHUB_STEP_SUMMARY" ] && echo "### ⚠️ Telegram notify skipped: repo/org variable TELEGRAM_CHAT_ID is not set" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
 
           esc() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
           REPO=$(esc "$GITHUB_REPOSITORY")
@@ -180,11 +187,12 @@ jobs:
 
           HTTP_CODE=""
           for attempt in 1 2 3; do
-            HTTP_CODE=$(curl -sS --max-time 10 -o /tmp/tg_resp.json -w "%{http_code}" \
+            # URL (with the token) goes in on stdin via -K, so it never appears in argv / ps.
+            HTTP_CODE=$(printf 'url = "%s"\n' "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+              | curl -sS --max-time 10 -o /tmp/tg_resp.json -w "%{http_code}" -K - \
               --data-urlencode "chat_id=${CHAT_ID}" \
               --data-urlencode "text=${MSG}" \
-              -d "parse_mode=HTML" -d "disable_web_page_preview=true" \
-              "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage")
+              -d "parse_mode=HTML" -d "disable_web_page_preview=true")
             if [ "$HTTP_CODE" = "200" ]; then
               echo "✅ Telegram ping sent (attempt ${attempt})"
               break

@@ -8,9 +8,14 @@
 #   make fanout VERSION=v1
 
 VERSION ?= v1
-PY ?= python3
-VENV ?= $(HOME)/.venv
-# Safe default for full-fleet fanouts — Codeberg silently throttles bursts.
+# `uv run` uses the project venv; a bare system python3 may lack the package
+# (ModuleNotFoundError on `make dry-run`). `--extra dev`
+# pulls pytest + ruff, which `uv run` skips by default.
+PY ?= uv run --extra dev python
+# soak + fanout run for ~1h+; on macOS keep the host awake for their duration
+# (a sleep mid-run freezes the poll loop). Empty elsewhere.
+CAFFEINATE := $(shell command -v caffeinate >/dev/null 2>&1 && echo caffeinate -i)
+# Safe default for full-fleet fanouts — some hosts silently throttle bursts.
 # Override to 0 for fast fanouts you're confident won't trip the limit.
 RATE_LIMIT_COOLDOWN ?= 360
 
@@ -36,7 +41,7 @@ test:
 lint:
 	$(PY) -m ruff check .
 	$(PY) -m ruff format --check .
-	@find .github/workflows .forgejo/workflows -name '*.yml' 2>/dev/null | xargs -r actionlint
+	@find .github/workflows .forgejo/workflows -name '*.yml' 2>/dev/null | xargs -r actionlint -config-file .github/actionlint.yaml
 
 dry-run:
 	$(PY) -m ci_workflows.sync --dry-run --caller-filter=all --version=$(VERSION)
@@ -45,10 +50,10 @@ pilot:
 	$(PY) -m ci_workflows.sync --caller-filter=example-org/example-app --version=$(VERSION)
 
 soak:
-	$(PY) -m ci_workflows.sync --soak-check=example-org/example-app --min-runs=3
+	$(CAFFEINATE) $(PY) -u -m ci_workflows.sync --soak-check=example-org/example-app --min-runs=3
 
 fanout:
-	$(PY) -m ci_workflows.sync --caller-filter=all --exclude=example-org/example-app --version=$(VERSION) --rate-limit-cooldown=$(RATE_LIMIT_COOLDOWN)
+	$(CAFFEINATE) $(PY) -u -m ci_workflows.sync --caller-filter=all --exclude=example-org/example-app --version=$(VERSION) --rate-limit-cooldown=$(RATE_LIMIT_COOLDOWN)
 
 drift:
 	$(PY) -m ci_workflows.drift --mode=check --version=$(VERSION)

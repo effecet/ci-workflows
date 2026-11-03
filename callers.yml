@@ -10,8 +10,9 @@
 #     tiny jobs at "Starting job" when the pool is contended.
 #   - A self-hosted runner (e.g. a Raspberry Pi 5 labelled "arm64-runner") has no
 #     runtime ceiling but limited concurrency (capacity = N concurrent jobs).
-#   - Strategy that worked: send heavy/long caller CI jobs to the self-hosted
-#     runner; keep the weekly cron sweep on the lightweight hosted runner.
+#   - Since v3.3.0 EVERY job defaults to the self-hosted `arm64-runner` label.
+#     A caller without a runner carrying that label must override every job
+#     (lint-test / lint-docs, gitleaks-fast, sweep), or those jobs queue forever.
 #   - Override per-job with `runs_on:` as shown below. On GitHub Actions, use
 #     `ubuntu-latest` (or your own self-hosted label) instead.
 version: 1
@@ -23,12 +24,15 @@ callers:
     runs_on:
       lint-test: ubuntu-latest
       gitleaks-fast: ubuntu-latest
+      sweep: ubuntu-latest
 
   # docs-static tier — markdown/docs lint + secret scan only
   - repo: example-org/example-docs
     tier: docs-static
     runs_on:
+      lint-docs: ubuntu-latest
       gitleaks-fast: ubuntu-latest
+      sweep: ubuntu-latest
     # `preserve` opts a caller-specific workflow out of the stale-workflow sweep
     # so it survives every sync. Example:
     # preserve:

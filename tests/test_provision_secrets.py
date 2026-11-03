@@ -38,10 +38,10 @@ def test_allowlist_contains_only_telegram_token():
 
 
 def test_provision_all_filters_chat_id_out():
-    """CHAT_ID must NOT be provisioned as a secret — it's hardcoded in the
-    notifier template (`reference_telegram_parse_mode_html` + Phase 1 spec
-    decision 8). Loading both keys from .env should raise rather than
-    silently ship CHAT_ID to every caller."""
+    """CHAT_ID must NOT be provisioned as a secret — the notifier template
+    reads it from the repository- or organization-level Actions variable vars.TELEGRAM_CHAT_ID.
+    Loading both keys from .env should raise rather than silently ship
+    CHAT_ID to every caller."""
     client = MagicMock()
     secrets = {"TELEGRAM_CI_TOKEN": "abc", "TELEGRAM_CI_CHAT_ID": "123"}
     with pytest.raises(UnknownSecretError, match="TELEGRAM_CI_CHAT_ID"):

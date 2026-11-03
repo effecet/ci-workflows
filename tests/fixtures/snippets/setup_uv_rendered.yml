@@ -1,8 +1,8 @@
       - name: Setup uv (with persistent cache)
         run: |
           set -eu
-          # pi-ci-runner:v3.1+ bakes uv at /usr/local/bin/uv — use it (zero
-          # network). Else shell-install (non-pi runners). Resolve uv via PATH,
+          # A runner image that bakes uv at /usr/local/bin/uv — use it (zero
+          # network). Else shell-install (other runners). Resolve uv via PATH,
           # NOT a hardcoded $HOME/.local/bin/uv: the astral installer's target
           # varies by user (root → /usr/local/bin, non-root → ~/.local/bin), so
           # the old hardcoded path 127'd on the baked root runner — v3.1.0 pilot

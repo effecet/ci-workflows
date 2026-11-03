@@ -13,8 +13,8 @@ jobs:
       - name: Setup uv (with persistent cache)
         run: |
           set -eu
-          # pi-ci-runner:v3.1+ bakes uv at /usr/local/bin/uv — use it (zero
-          # network). Else shell-install (non-pi runners). Resolve uv via PATH,
+          # A runner image that bakes uv at /usr/local/bin/uv — use it (zero
+          # network). Else shell-install (other runners). Resolve uv via PATH,
           # NOT a hardcoded $HOME/.local/bin/uv: the astral installer's target
           # varies by user (root → /usr/local/bin, non-root → ~/.local/bin), so
           # the old hardcoded path 127'd on the baked root runner — v3.1.0 pilot
@@ -41,18 +41,48 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # Only editable-install if this is actually a Python package. uv's own
-          # heuristic: a [project]/[build-system] table in pyproject.toml, OR a
-          # setup.py / setup.cfg. Config-only pyproject.toml (e.g. just
-          # [tool.pytest.ini_options]) is NOT a package — skip the editable install
-          # and rely on requirements*.txt. No `|| true`: a real package with a
-          # broken build still fails loudly.
-          if [ -f setup.py ] || [ -f setup.cfg ] || { [ -f pyproject.toml ] && grep -qE '^\[(project|build-system)\]' pyproject.toml; }; then
-            uv pip install -e '.[dev]' 2>/dev/null || uv pip install -e .
+          if [ -f uv.lock ]; then
+            # Lock present → reproducible, pinned install from the committed lock.
+            # --locked fails loud if uv.lock is out of sync with pyproject.toml; a
+            # stale lock must be re-locked by the consumer (`uv lock`), NOT silently
+            # used. --all-extras installs every
+            # [project.optional-dependencies] extra; --dev installs the dev
+            # dependency-group. Matches uv's canonical CI recipe.
+            uv sync --locked --all-extras --dev
+          else
+            # No lock → unchanged unlocked behavior (resolve-latest at run time).
+            # Only editable-install if this is actually a Python package (uv's
+            # heuristic: [project]/[build-system] table, or setup.py/setup.cfg).
+            if [ -f setup.py ] || [ -f setup.cfg ] || { [ -f pyproject.toml ] && grep -qE '^\[(project|build-system)\]' pyproject.toml; }; then
+              uv pip install -e '.[dev]' 2>/dev/null || uv pip install -e .
+            fi
+            if [ -f requirements.txt ]; then uv pip install -r requirements.txt; fi
+            if [ -f requirements-dev.txt ]; then uv pip install -r requirements-dev.txt; fi
           fi
-          if [ -f requirements.txt ]; then uv pip install -r requirements.txt; fi
-          if [ -f requirements-dev.txt ]; then uv pip install -r requirements-dev.txt; fi
-          uv pip install ruff pytest pytest-xdist
+          # Test tooling — always, AFTER the install branch so `uv sync`'s
+          # exact-match prune can't strip it.
+          #
+          # ruff is PINNED below 0.16 on purpose. Unpinned, every caller silently
+          # resolves whatever ruff is newest at run time, so a ruff release can
+          # break green repos that changed nothing. 0.16.0 did exactly that, twice
+          # over (verified head-to-head on a real caller's tracked files):
+          #
+          #   * `ruff format` began formatting Python code blocks inside Markdown
+          #     by default. 0.15.22 refuses ("Markdown formatting is experimental,
+          #     enable preview mode"); 0.16.1 reformats. Callers with code samples
+          #     in docs start failing the format gate.
+          #   * The default lint rule set expanded well past E4/E7/E9/F. Same files,
+          #     no config: 0.15.22 → "All checks passed!", 0.16.1 → 32 errors
+          #     (RET, PLR, PLW, RUF, I, S, DTZ, XE...).
+          #
+          # Moving to 0.16+ is a real migration (callers need `select` pinned and
+          # docs excluded), so it should be a deliberate release of this template,
+          # not a surprise from `uv pip install`. Bump this ceiling only alongside
+          # that migration.
+          #
+          # pytest/pytest-xdist remain unpinned — no observed breakage — but they
+          # carry the same latent risk if you ever need somewhere to look.
+          uv pip install 'ruff>=0.15,<0.16' pytest pytest-xdist
 
       - name: Ruff format check
         run: ruff format --check .
@@ -71,10 +101,11 @@ jobs:
         if: failure()
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_CI_TOKEN }}
-          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
         run: |
           set +e
           [ -z "$TELEGRAM_TOKEN" ] && { echo "⚠️ notify skip: TELEGRAM_CI_TOKEN missing"; exit 0; }
+          [ -z "$CHAT_ID" ] && { echo "⚠️ notify skip: vars.TELEGRAM_CHAT_ID missing"; [ -n "$GITHUB_STEP_SUMMARY" ] && echo "### ⚠️ Telegram notify skipped: repo/org variable TELEGRAM_CHAT_ID is not set" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
 
           esc() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
           REPO=$(esc "$GITHUB_REPOSITORY")
@@ -115,11 +146,12 @@ jobs:
 
           HTTP_CODE=""
           for attempt in 1 2 3; do
-            HTTP_CODE=$(curl -sS --max-time 10 -o /tmp/tg_resp.json -w "%{http_code}" \
+            # URL (with the token) goes in on stdin via -K, so it never appears in argv / ps.
+            HTTP_CODE=$(printf 'url = "%s"\n' "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+              | curl -sS --max-time 10 -o /tmp/tg_resp.json -w "%{http_code}" -K - \
               --data-urlencode "chat_id=${CHAT_ID}" \
               --data-urlencode "text=${MSG}" \
-              -d "parse_mode=HTML" -d "disable_web_page_preview=true" \
-              "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage")
+              -d "parse_mode=HTML" -d "disable_web_page_preview=true")
             if [ "$HTTP_CODE" = "200" ]; then
               echo "✅ Telegram ping sent (attempt ${attempt})"
               break
@@ -150,7 +182,7 @@ jobs:
           fetch-depth: 1
       - name: Ensure gitleaks (baked, else retry-curl)
         run: |
-          # arm64-runner bakes gitleaks 8.30.1 into pi-ci-runner:v3.1 — use it
+          # a runner image with gitleaks 8.30.1 baked in — use it
           # with ZERO network. Any other runner: retry-wrapped (3×, backoff)
           # curl of the pinned static binary. Cross-arch: gitleaks publishes
           # linux_x64 + linux_arm64; uname -m → aarch64 on ARM, x86_64 on x64.
@@ -161,8 +193,11 @@ jobs:
             *)             echo "unsupported arch: $(uname -m)"; exit 2 ;;
           esac
           for i in 1 2 3; do
-            curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_${GL_ARCH}.tar.gz" \
-              | tar -xz -C /usr/local/bin gitleaks && exit 0; sleep $((i * 5))
+            if curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_${GL_ARCH}.tar.gz" \
+              | tar -xz -C /usr/local/bin gitleaks; then
+              exit 0
+            fi
+            sleep $((i * 5))
           done
           echo "gitleaks unavailable after retries"; exit 1
       - name: Gitleaks (no-git, PR diff only)
@@ -177,10 +212,11 @@ jobs:
         if: failure()
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_CI_TOKEN }}
-          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
         run: |
           set +e
           [ -z "$TELEGRAM_TOKEN" ] && { echo "⚠️ notify skip: TELEGRAM_CI_TOKEN missing"; exit 0; }
+          [ -z "$CHAT_ID" ] && { echo "⚠️ notify skip: vars.TELEGRAM_CHAT_ID missing"; [ -n "$GITHUB_STEP_SUMMARY" ] && echo "### ⚠️ Telegram notify skipped: repo/org variable TELEGRAM_CHAT_ID is not set" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
 
           esc() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
           REPO=$(esc "$GITHUB_REPOSITORY")
@@ -221,11 +257,12 @@ jobs:
 
           HTTP_CODE=""
           for attempt in 1 2 3; do
-            HTTP_CODE=$(curl -sS --max-time 10 -o /tmp/tg_resp.json -w "%{http_code}" \
+            # URL (with the token) goes in on stdin via -K, so it never appears in argv / ps.
+            HTTP_CODE=$(printf 'url = "%s"\n' "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+              | curl -sS --max-time 10 -o /tmp/tg_resp.json -w "%{http_code}" -K - \
               --data-urlencode "chat_id=${CHAT_ID}" \
               --data-urlencode "text=${MSG}" \
-              -d "parse_mode=HTML" -d "disable_web_page_preview=true" \
-              "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage")
+              -d "parse_mode=HTML" -d "disable_web_page_preview=true")
             if [ "$HTTP_CODE" = "200" ]; then
               echo "✅ Telegram ping sent (attempt ${attempt})"
               break

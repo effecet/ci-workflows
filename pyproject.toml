@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ci-workflows"
-version = "3.1.1"
+version = "3.3.1"
 description = "Central CI templates + sync tooling for a fleet of repositories"
 requires-python = ">=3.12"
 dependencies = [
@@ -15,7 +15,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
-  "ruff>=0.5",
+  "ruff==0.16.2",  # same pin as CI, so `make lint` agrees with it
 ]
 
 [project.scripts]

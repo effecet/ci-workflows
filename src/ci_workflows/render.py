@@ -77,7 +77,7 @@ def _substitute_runs_on(body: str, caller: Caller) -> str:
     """Replace {RUNS_ON_<JOB>} placeholders with the caller's per-job runner label.
 
     <JOB> is uppercased with hyphens → underscores; e.g. {RUNS_ON_LINT_TEST}
-    looks up `lint-test` in caller.runs_on, defaulting to "codeberg-tiny".
+    looks up `lint-test` via caller.runs_on_for (override, tier default, then DEFAULT_RUNS_ON).
     """
 
     def repl(m: re.Match[str]) -> str:

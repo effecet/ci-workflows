@@ -126,11 +126,9 @@ def test_render_template_runs_on_omitted_jobs_use_tier_defaults():
     """Partial override case (post-2026-05-12 tier-defaults):
 
     When a caller specifies only ONE runs_on entry, omitted jobs fall back
-    to TIER_DEFAULTS (not the global codeberg-tiny default any more). For
-    python-app this means lint-test + gitleaks-fast both default to arm64-runner.
-
-    Verify that overriding lint-test to codeberg-medium leaves gitleaks-fast
-    at the tier-default arm64-runner, NOT the global codeberg-tiny default.
+    to TIER_DEFAULTS. For python-app this means gitleaks-fast stays arm64-runner.
+    (Tier default vs global fallback is told apart in test_registry.py with a
+    sentinel, since both are arm64-runner now.)
     """
     partial = Caller(
         repo="example-org/partial",
@@ -149,7 +147,7 @@ def test_render_template_runs_on_omitted_jobs_use_tier_defaults():
     )
     assert "runs-on: codeberg-medium" in got  # lint-test override applied
     assert "runs-on: arm64-runner" in got  # gitleaks-fast falls back to tier-default
-    assert "runs-on: codeberg-tiny" not in got  # NOT the global default any more
+    assert got.count("runs-on: arm64-runner") == 1  # gitleaks-fast only; lint-test overridden
     assert "{RUNS_ON_" not in got  # all placeholders resolved
 
 
