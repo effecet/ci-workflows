@@ -24,9 +24,10 @@ jobs:
       - name: Install dependencies
         run: |
           uv venv
-          # ruff is pinned: an unpinned install turned CI red when a new release
-          # widened the default rules. Bump deliberately (Dependabot cannot see this line).
-          uv pip install -e '.[dev]' 'ruff==0.16.2' pytest pyyaml
+          # ruff is pinned in pyproject.toml's `dev` extra (single source of truth):
+          # an unpinned install turned CI red when a new release widened the default
+          # rules. Don't re-pin it here — Dependabot only bumps pyproject.toml.
+          uv pip install -e '.[dev]' pytest pyyaml
 
       - name: Install actionlint + shellcheck (for render validation tests)
         run: |
